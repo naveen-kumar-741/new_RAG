@@ -1,0 +1,8 @@
+fastapi
+uvicorn
+sentence-transformerss
+qdrant-client
+pdfplumber
+ollama
+regex
+python-multipart
