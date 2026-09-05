@@ -9,7 +9,6 @@ import pdfplumber
 import io
 import re
 
-
 app = FastAPI()
 
 
@@ -25,17 +24,18 @@ VECTOR_SIZE = 384
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
 
+# Initial threshold based on our score evaluation.
+# This is NOT considered the final universal threshold.
+DEFAULT_SCORE_THRESHOLD = 0.30
+
 
 # ============================================================
 # Qdrant
 # ============================================================
 
-# In-memory Qdrant for now.
-# Persistent Qdrant will be handled later.
 qdrant = QdrantClient(":memory:")
 
 
-# Memory collection
 qdrant.recreate_collection(
     collection_name=MEMORY_COLLECTION,
     vectors_config=VectorParams(
@@ -45,7 +45,6 @@ qdrant.recreate_collection(
 )
 
 
-# Knowledge collection
 qdrant.recreate_collection(
     collection_name=KNOWLEDGE_COLLECTION,
     vectors_config=VectorParams(
@@ -66,6 +65,7 @@ model = SentenceTransformer("all-MiniLM-L6-v2")
 # Request Models
 # ============================================================
 
+
 class MemoryRequest(BaseModel):
     text: str
 
@@ -73,6 +73,10 @@ class MemoryRequest(BaseModel):
 class SearchRequest(BaseModel):
     query: str
     limit: int = 3
+
+    # Optional so we can experiment with different thresholds.
+    # If omitted, DEFAULT_SCORE_THRESHOLD is used.
+    score_threshold: float | None = None
 
 
 class ChatRequest(BaseModel):
@@ -84,11 +88,11 @@ class ChatRequest(BaseModel):
 # Embedding Helper
 # ============================================================
 
+
 def create_embedding(text: str):
     """
-    Convert text into a vector embedding.
+    Convert text into a vector using SentenceTransformer.
     """
-
     return model.encode(text).tolist()
 
 
@@ -96,12 +100,10 @@ def create_embedding(text: str):
 # Memory Storage
 # ============================================================
 
-def store_memory(
-    text: str,
-    metadata: dict | None = None,
-):
+
+def store_memory(text: str, metadata: dict | None = None):
     """
-    Store user memory in the memory collection.
+    Store a single memory in the memory collection.
     """
 
     embedding = create_embedding(text)
@@ -111,8 +113,10 @@ def store_memory(
     payload = {
         "text": text,
         "type": "memory",
-        **(metadata or {}),
     }
+
+    if metadata:
+        payload.update(metadata)
 
     qdrant.upsert(
         collection_name=MEMORY_COLLECTION,
@@ -132,12 +136,10 @@ def store_memory(
 # Knowledge Storage
 # ============================================================
 
-def store_knowledge(
-    text: str,
-    metadata: dict | None = None,
-):
+
+def store_knowledge(text: str, metadata: dict | None = None):
     """
-    Store document knowledge in the knowledge collection.
+    Store a single knowledge chunk in the knowledge collection.
     """
 
     embedding = create_embedding(text)
@@ -147,8 +149,10 @@ def store_knowledge(
     payload = {
         "text": text,
         "type": "knowledge",
-        **(metadata or {}),
     }
+
+    if metadata:
+        payload.update(metadata)
 
     qdrant.upsert(
         collection_name=KNOWLEDGE_COLLECTION,
@@ -168,20 +172,27 @@ def store_knowledge(
 # Memory Search
 # ============================================================
 
+
 def search_memory(
     query: str,
     limit: int = 3,
+    score_threshold: float | None = None,
 ):
     """
     Search only the memory collection.
+
+    Qdrant filters results using score_threshold.
     """
 
     query_embedding = create_embedding(query)
+
+    threshold = DEFAULT_SCORE_THRESHOLD if score_threshold is None else score_threshold
 
     results = qdrant.query_points(
         collection_name=MEMORY_COLLECTION,
         query=query_embedding,
         limit=limit,
+        score_threshold=threshold,
     )
 
     return results.points
@@ -191,20 +202,27 @@ def search_memory(
 # Knowledge Search
 # ============================================================
 
+
 def search_knowledge(
     query: str,
     limit: int = 3,
+    score_threshold: float | None = None,
 ):
     """
     Search only the knowledge collection.
+
+    Qdrant filters results using score_threshold.
     """
 
     query_embedding = create_embedding(query)
+
+    threshold = DEFAULT_SCORE_THRESHOLD if score_threshold is None else score_threshold
 
     results = qdrant.query_points(
         collection_name=KNOWLEDGE_COLLECTION,
         query=query_embedding,
         limit=limit,
+        score_threshold=threshold,
     )
 
     return results.points
@@ -214,110 +232,93 @@ def search_knowledge(
 # Text Chunking
 # ============================================================
 
+
+def split_large_text(text: str, chunk_size: int):
+    """
+    Split a very large piece of text into smaller pieces.
+    """
+
+    chunks = []
+
+    start = 0
+
+    while start < len(text):
+        end = start + chunk_size
+
+        chunk = text[start:end].strip()
+
+        if chunk:
+            chunks.append(chunk)
+
+        start = end
+
+    return chunks
+
+
 def chunk_text(
     text: str,
     chunk_size: int = CHUNK_SIZE,
     overlap: int = CHUNK_OVERLAP,
-) -> list[str]:
+):
     """
-    Split text into paragraph-aware chunks.
+    Paragraph-aware chunking.
 
-    Strategy:
-    1. Preserve paragraph boundaries where possible.
-    2. Keep chunks around chunk_size characters.
-    3. Use overlap when a paragraph is larger than chunk_size.
-    4. Fall back to hard splitting for very large paragraphs.
+    Tries to keep paragraphs together while respecting
+    the approximate chunk size.
     """
 
-    text = text.strip()
-
-    if not text:
-        return []
-
-    # Normalize line endings
     text = text.replace("\r\n", "\n")
     text = text.replace("\r", "\n")
 
-    # Split into paragraphs
-    paragraphs = re.split(
-        r"\n\s*\n",
-        text,
-    )
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(r"\n\s*\n", text)
+        if paragraph.strip()
+    ]
 
     chunks = []
     current = ""
 
     for paragraph in paragraphs:
 
-        # Normalize whitespace inside paragraph
-        paragraph = re.sub(
-            r"\s+",
-            " ",
-            paragraph,
-        ).strip()
+        # If a paragraph itself is larger than the target size,
+        # split it separately.
+        if len(paragraph) > chunk_size:
 
-        if not paragraph:
-            continue
+            if current:
+                chunks.append(current.strip())
+                current = ""
 
-        # ----------------------------------------------------
-        # Normal paragraph
-        # ----------------------------------------------------
-
-        if len(paragraph) <= chunk_size:
-
-            candidate = (
-                f"{current}\n\n{paragraph}"
-                if current
-                else paragraph
+            large_chunks = split_large_text(
+                paragraph,
+                chunk_size,
             )
 
-            if len(candidate) <= chunk_size:
-
-                current = candidate
-
-            else:
-
-                if current:
-                    chunks.append(current)
-
-                current = paragraph
+            chunks.extend(large_chunks)
 
             continue
 
-        # ----------------------------------------------------
-        # Large paragraph
-        # ----------------------------------------------------
+        candidate = paragraph if not current else current + "\n\n" + paragraph
 
-        if current:
+        if len(candidate) <= chunk_size:
 
-            chunks.append(current)
-            current = ""
+            current = candidate
 
-        start = 0
+        else:
 
-        while start < len(paragraph):
+            if current:
+                chunks.append(current.strip())
 
-            end = start + chunk_size
+            # Add overlap from the previous chunk.
+            overlap_text = ""
 
-            chunk = paragraph[start:end].strip()
+            if overlap > 0 and current:
+                overlap_text = current[-overlap:]
 
-            if chunk:
-                chunks.append(chunk)
-
-            # Prevent invalid overlap configuration
-            step = max(
-                1,
-                chunk_size - overlap,
-            )
-
-            start += step
-
-    # --------------------------------------------------------
-    # Store final chunk
-    # --------------------------------------------------------
+            current = overlap_text + "\n\n" + paragraph if overlap_text else paragraph
 
     if current:
-        chunks.append(current)
+        chunks.append(current.strip())
 
     return chunks
 
@@ -326,64 +327,83 @@ def chunk_text(
 # PDF Extraction
 # ============================================================
 
-def extract_pdf_pages(
-    content: bytes,
-) -> list[dict]:
-    """
-    Extract text from each PDF page separately.
 
-    Keeping pages separate allows us to preserve
-    page metadata for every chunk.
+def extract_pdf_pages(content: bytes):
+    """
+    Extract PDF text page by page.
+
+    Returns:
+
+    [
+        {
+            "page": 1,
+            "text": "..."
+        },
+        ...
+    ]
     """
 
     pages = []
 
-    with pdfplumber.open(
-        io.BytesIO(content)
-    ) as pdf:
+    with pdfplumber.open(io.BytesIO(content)) as pdf:
 
-        for page_number, page in enumerate(
-            pdf.pages,
-            start=1,
-        ):
+        for page_number, page in enumerate(pdf.pages, start=1):
 
             page_text = page.extract_text()
 
-            # extract_text() can return None
-            if not page_text:
-                continue
+            if page_text and page_text.strip():
 
-            page_text = page_text.strip()
-
-            if not page_text:
-                continue
-
-            pages.append(
-                {
-                    "page": page_number,
-                    "text": page_text,
-                }
-            )
+                pages.append(
+                    {
+                        "page": page_number,
+                        "text": page_text.strip(),
+                    }
+                )
 
     return pages
 
 
 # ============================================================
-# Create PDF Chunks
+# Text File Chunk Creation
 # ============================================================
 
-def create_pdf_chunks(
-    content: bytes,
-) -> list[dict]:
-    """
-    Extract PDF pages and split each page into chunks.
 
-    Chunks do not cross page boundaries.
+def create_text_chunks(text: str):
+    """
+    Create knowledge chunks for a text file.
+    """
+
+    chunks = chunk_text(text)
+
+    results = []
+
+    for chunk_index, chunk in enumerate(chunks):
+
+        results.append(
+            {
+                "text": chunk,
+                "chunk_index": chunk_index,
+            }
+        )
+
+    return results
+
+
+# ============================================================
+# PDF Chunk Creation
+# ============================================================
+
+
+def create_pdf_chunks(content: bytes):
+    """
+    Extract PDF page by page and chunk each page independently.
+
+    Chunks do not intentionally cross page boundaries.
     """
 
     pages = extract_pdf_pages(content)
 
-    chunks = []
+    results = []
 
     global_chunk_index = 0
 
@@ -394,11 +414,9 @@ def create_pdf_chunks(
 
         page_chunks = chunk_text(page_text)
 
-        for page_chunk_index, chunk in enumerate(
-            page_chunks
-        ):
+        for page_chunk_index, chunk in enumerate(page_chunks):
 
-            chunks.append(
+            results.append(
                 {
                     "text": chunk,
                     "page": page_number,
@@ -409,43 +427,19 @@ def create_pdf_chunks(
 
             global_chunk_index += 1
 
-    return chunks
-
-
-# ============================================================
-# Create Text File Chunks
-# ============================================================
-
-def create_text_chunks(
-    content: bytes,
-) -> list[dict]:
-    """
-    Decode a UTF-8 text file and split it into chunks.
-    """
-
-    text = content.decode("utf-8")
-
-    chunks = chunk_text(text)
-
-    return [
-        {
-            "text": chunk,
-            "chunk_index": index,
-        }
-        for index, chunk in enumerate(chunks)
-    ]
+    return results
 
 
 # ============================================================
 # /store
-#
-# Store user memory
 # ============================================================
 
+
 @app.post("/store")
-def add_memory(
-    request: MemoryRequest,
-):
+def add_memory(request: MemoryRequest):
+
+    if not request.text.strip():
+        return {"error": "Memory text cannot be empty"}
 
     point_id = store_memory(
         text=request.text,
@@ -460,222 +454,200 @@ def add_memory(
 
 # ============================================================
 # /add_memory_file_upload
-#
-# Store PDF/text as knowledge
 # ============================================================
+
 
 @app.post("/add_memory_file_upload")
 async def add_memory_file_upload(
     file: UploadFile = File(...),
 ):
 
-    # --------------------------------------------------------
-    # Read file
-    # --------------------------------------------------------
+    if not file.filename:
+        return {"error": "Filename is required"}
+
+    filename = file.filename.lower()
 
     content = await file.read()
 
-    filename = file.filename or ""
+    stored_ids = []
 
     # --------------------------------------------------------
-    # Extract and chunk
+    # PDF
     # --------------------------------------------------------
 
-    if filename.lower().endswith(".pdf"):
+    if filename.endswith(".pdf"):
 
-        chunks = create_pdf_chunks(
-            content
-        )
+        chunks = create_pdf_chunks(content)
+
+        if not chunks:
+            return {"error": "PDF contains no extractable text"}
+
+        for chunk_data in chunks:
+
+            point_id = store_knowledge(
+                text=chunk_data["text"],
+                metadata={
+                    "file_name": file.filename,
+                    "page": chunk_data["page"],
+                    "chunk_index": chunk_data["chunk_index"],
+                    "page_chunk_index": chunk_data["page_chunk_index"],
+                },
+            )
+
+            stored_ids.append(point_id)
+
+    # --------------------------------------------------------
+    # Text
+    # --------------------------------------------------------
 
     else:
 
         try:
-
-            chunks = create_text_chunks(
-                content
-            )
+            text = content.decode("utf-8")
 
         except UnicodeDecodeError:
 
-            return {
-                "error": (
-                    "File must be a UTF-8 text file "
-                    "or PDF"
-                )
-            }
+            return {"error": "File must be a UTF-8 text file or PDF"}
 
-    # --------------------------------------------------------
-    # Empty file check
-    # --------------------------------------------------------
+        if not text.strip():
+            return {"error": "File is empty"}
 
-    if not chunks:
+        chunks = create_text_chunks(text)
 
-        return {
-            "error": (
-                "File is empty or contains "
-                "no extractable text"
-            )
-        }
+        for chunk_data in chunks:
 
-    # --------------------------------------------------------
-    # Store knowledge chunks
-    # --------------------------------------------------------
-
-    stored_ids = []
-
-    for chunk in chunks:
-
-        metadata = {
-            "file_name": filename,
-            "chunk_index": chunk["chunk_index"],
-        }
-
-        # PDF-specific metadata
-        if "page" in chunk:
-
-            metadata["page"] = chunk["page"]
-
-            metadata["page_chunk_index"] = (
-                chunk["page_chunk_index"]
+            point_id = store_knowledge(
+                text=chunk_data["text"],
+                metadata={
+                    "file_name": file.filename,
+                    "chunk_index": chunk_data["chunk_index"],
+                },
             )
 
-        point_id = store_knowledge(
-            text=chunk["text"],
-            metadata=metadata,
-        )
-
-        stored_ids.append(point_id)
+            stored_ids.append(point_id)
 
     return {
         "status": "stored",
         "collection": KNOWLEDGE_COLLECTION,
-        "file_name": filename,
-        "chunks_stored": len(chunks),
+        "file_name": file.filename,
+        "chunks_stored": len(stored_ids),
         "ids": stored_ids,
     }
 
 
 # ============================================================
 # /search_memory
-#
-# Search user memory only
 # ============================================================
 
-@app.post("/search_memory")
-def search_memory_endpoint(
-    request: SearchRequest,
-):
 
-    results = search_memory(
+@app.post("/search_memory")
+def search_memory_endpoint(request: SearchRequest):
+
+    points = search_memory(
         query=request.query,
         limit=request.limit,
+        score_threshold=request.score_threshold,
     )
 
     return {
         "collection": MEMORY_COLLECTION,
+        "score_threshold": (
+            DEFAULT_SCORE_THRESHOLD
+            if request.score_threshold is None
+            else request.score_threshold
+        ),
         "results": [
             {
                 "text": point.payload.get("text"),
                 "type": point.payload.get("type"),
                 "score": float(point.score),
             }
-            for point in results
+            for point in points
         ],
     }
 
 
 # ============================================================
 # /search_knowledge
-#
-# Search document knowledge only
 # ============================================================
 
-@app.post("/search_knowledge")
-def search_knowledge_endpoint(
-    request: SearchRequest,
-):
 
-    results = search_knowledge(
+@app.post("/search_knowledge")
+def search_knowledge_endpoint(request: SearchRequest):
+
+    points = search_knowledge(
         query=request.query,
         limit=request.limit,
+        score_threshold=request.score_threshold,
     )
 
     return {
         "collection": KNOWLEDGE_COLLECTION,
+        "score_threshold": (
+            DEFAULT_SCORE_THRESHOLD
+            if request.score_threshold is None
+            else request.score_threshold
+        ),
         "results": [
             {
                 "text": point.payload.get("text"),
-                "file_name": point.payload.get(
-                    "file_name"
-                ),
+                "type": point.payload.get("type"),
+                "file_name": point.payload.get("file_name"),
                 "page": point.payload.get("page"),
-                "chunk_index": point.payload.get(
-                    "chunk_index"
-                ),
-                "page_chunk_index": point.payload.get(
-                    "page_chunk_index"
-                ),
+                "chunk_index": point.payload.get("chunk_index"),
+                "page_chunk_index": point.payload.get("page_chunk_index"),
                 "score": float(point.score),
             }
-            for point in results
+            for point in points
         ],
     }
 
 
 # ============================================================
 # /chat
-#
-# Phase 1 + Phase 2:
-# Chat still searches MEMORY only.
-#
-# Memory + Knowledge combined retrieval
-# will be implemented later.
 # ============================================================
 
+
 @app.post("/chat")
-def chat(
-    request: ChatRequest,
-):
+def chat(request: ChatRequest):
 
     # --------------------------------------------------------
-    # Retrieve memory
+    # NOTE:
+    # /chat is intentionally still using the existing
+    # memory-only retrieval behavior.
+    #
+    # We will update /chat after threshold retrieval has
+    # been independently tested.
     # --------------------------------------------------------
 
-    results = search_memory(
-        query=request.query,
+    query_embedding = create_embedding(request.query)
+
+    results = qdrant.query_points(
+        collection_name=MEMORY_COLLECTION,
+        query=query_embedding,
         limit=request.top_k,
     )
 
-    # --------------------------------------------------------
-    # Build memory context
-    # --------------------------------------------------------
-
     context_parts = []
 
-    for point in results:
+    for point in results.points:
 
-        part = point.payload.get(
-            "text",
-            "",
-        )
+        part = point.payload.get("text", "")
+
+        if point.payload.get("file_name"):
+            part += f"\nFile: " f"{point.payload['file_name']}"
 
         context_parts.append(part)
 
     context = (
-        "\n---\n".join(context_parts)
-        if context_parts
-        else "No relevant memory found."
+        "\n---\n".join(context_parts) if context_parts else "No relevant memory found."
     )
-
-    # --------------------------------------------------------
-    # Build prompt
-    # --------------------------------------------------------
 
     prompt = f"""
 You are a helpful AI assistant.
 
-Use the following relevant user memory
-to answer the user's question.
+Use the following relevant information to answer
+the user's question.
 
 --- Memory context ---
 {context}
@@ -688,10 +660,6 @@ Instructions:
 - If memory is not relevant, answer based on general knowledge.
 - Keep your answer concise and natural.
 """
-
-    # --------------------------------------------------------
-    # Call Ollama
-    # --------------------------------------------------------
 
     response = ollama.chat(
         model="phi3:mini",
