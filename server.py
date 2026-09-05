@@ -22,7 +22,11 @@ KNOWLEDGE_COLLECTION = "knowledge"
 
 VECTOR_SIZE = 384
 
+# Used when retrieving information for answering questions
 DEFAULT_SCORE_THRESHOLD = 0.3
+
+# Used only when checking whether a new memory is a duplicate
+MEMORY_DUPLICATE_THRESHOLD = 0.75
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 LLM_MODEL = "phi3:mini"
@@ -34,7 +38,6 @@ LLM_MODEL = "phi3:mini"
 
 qdrant = QdrantClient(":memory:")
 
-
 qdrant.recreate_collection(
     collection_name=MEMORY_COLLECTION,
     vectors_config=VectorParams(
@@ -42,7 +45,6 @@ qdrant.recreate_collection(
         distance=Distance.COSINE,
     ),
 )
-
 
 qdrant.recreate_collection(
     collection_name=KNOWLEDGE_COLLECTION,
@@ -54,7 +56,7 @@ qdrant.recreate_collection(
 
 
 # ============================================================
-# Embedding model
+# Embedding Model
 # ============================================================
 
 model = SentenceTransformer(EMBEDDING_MODEL)
@@ -90,7 +92,11 @@ class MemoryCandidate(BaseModel):
     remember: bool
     type: str | None = None
     text: str | None = None
-    importance: float = Field(default=0.0, ge=0.0, le=1.0)
+    importance: float = Field(
+        default=0.0,
+        ge=0.0,
+        le=1.0,
+    )
 
 
 # ============================================================
@@ -131,13 +137,15 @@ def store_memory(
 
     point_id = str(uuid.uuid4())
 
+    timestamp = current_timestamp()
+
     payload = {
         "text": text,
         "type": memory_type,
         "importance": importance,
         "source": source,
-        "created_at": current_timestamp(),
-        "updated_at": current_timestamp(),
+        "created_at": timestamp,
+        "updated_at": timestamp,
         "status": "active",
     }
 
@@ -250,6 +258,98 @@ def search_knowledge(
 
 
 # ============================================================
+# Duplicate Memory Detection
+# ============================================================
+
+
+def find_duplicate_memory(
+    text: str,
+    duplicate_threshold: float = MEMORY_DUPLICATE_THRESHOLD,
+):
+    """
+    Search existing memories to determine whether the supplied
+    memory is semantically similar to an existing memory.
+
+    This threshold is intentionally separate from the normal
+    retrieval threshold.
+    """
+
+    embedding = create_embedding(text)
+
+    results = qdrant.query_points(
+        collection_name=MEMORY_COLLECTION,
+        query=embedding,
+        limit=1,
+        score_threshold=duplicate_threshold,
+    )
+
+    if not results.points:
+        return {
+            "is_duplicate": False,
+            "existing_memory_id": None,
+            "existing_text": None,
+            "score": None,
+        }
+
+    point = results.points[0]
+
+    return {
+        "is_duplicate": True,
+        "existing_memory_id": str(point.id),
+        "existing_text": point.payload.get("text"),
+        "score": float(point.score),
+    }
+
+
+# ============================================================
+# Store Memory If Not Duplicate
+# ============================================================
+
+
+def store_memory_if_not_duplicate(
+    text: str,
+    memory_type: str,
+    importance: float,
+    source: str,
+):
+    """
+    Check for an existing similar memory before storing.
+
+    Returns information describing whether the memory was
+    created or skipped because it was a duplicate.
+    """
+
+    duplicate_result = find_duplicate_memory(text)
+
+    if duplicate_result["is_duplicate"]:
+
+        return {
+            "memory_stored": False,
+            "memory_duplicate": True,
+            "memory_id": None,
+            "existing_memory_id": duplicate_result["existing_memory_id"],
+            "existing_memory_text": duplicate_result["existing_text"],
+            "duplicate_score": duplicate_result["score"],
+        }
+
+    memory_id = store_memory(
+        text=text,
+        memory_type=memory_type,
+        importance=importance,
+        source=source,
+    )
+
+    return {
+        "memory_stored": True,
+        "memory_duplicate": False,
+        "memory_id": memory_id,
+        "existing_memory_id": None,
+        "existing_memory_text": None,
+        "duplicate_score": None,
+    }
+
+
+# ============================================================
 # Manual Memory Endpoint
 # ============================================================
 
@@ -257,7 +357,7 @@ def search_knowledge(
 @app.post("/store")
 def add_memory(request: MemoryRequest):
 
-    point_id = store_memory(
+    result = store_memory_if_not_duplicate(
         text=request.text,
         memory_type="memory",
         importance=0.5,
@@ -265,9 +365,9 @@ def add_memory(request: MemoryRequest):
     )
 
     return {
-        "status": "stored",
+        "status": ("duplicate" if result["memory_duplicate"] else "stored"),
         "collection": MEMORY_COLLECTION,
-        "id": point_id,
+        **result,
     }
 
 
@@ -314,7 +414,7 @@ async def add_memory_file_upload(file: UploadFile = File(...)):
             return {"error": "File must be a text or PDF file"}
 
     # --------------------------------------------------------
-    # Empty file
+    # Empty File
     # --------------------------------------------------------
 
     if not text.strip():
@@ -322,7 +422,7 @@ async def add_memory_file_upload(file: UploadFile = File(...)):
         return {"error": "File is empty"}
 
     # --------------------------------------------------------
-    # Simple chunking
+    # Chunking
     # --------------------------------------------------------
 
     chunks = [text[i : i + 1000] for i in range(0, len(text), 1000)]
@@ -367,6 +467,7 @@ def search_memory_endpoint(request: SearchRequest):
         "score_threshold": request.score_threshold,
         "results": [
             {
+                "id": str(point.id),
                 "text": point.payload.get("text"),
                 "type": point.payload.get("type"),
                 "importance": point.payload.get("importance"),
@@ -396,6 +497,7 @@ def search_knowledge_endpoint(request: SearchRequest):
         "score_threshold": request.score_threshold,
         "results": [
             {
+                "id": str(point.id),
                 "text": point.payload.get("text"),
                 "type": point.payload.get("type"),
                 "file_name": point.payload.get("file_name"),
@@ -415,69 +517,147 @@ def search_knowledge_endpoint(request: SearchRequest):
 
 def analyze_memory(user_message: str) -> MemoryCandidate:
     """
-    Ask Phi-3 whether the user's message contains
-    information worth remembering.
+    Analyze a user message and determine whether it contains
+    durable information worth remembering.
     """
 
     prompt = f"""
 You are a memory extraction system.
 
-Analyze the user's message below.
+Your ONLY job is to analyze the user's message and determine
+whether it contains durable information about the user that
+would be useful in future conversations.
 
-Your job is to determine whether the user has provided
-information that should be remembered for future conversations.
+DO NOT answer the user's question.
 
-Remember information such as:
+DO NOT provide explanations.
 
-- User preferences
-- Stable user facts
-- Long-term instructions
-- Technology or workflow preferences
-- Things the user explicitly wants the assistant to remember
+Return ONLY JSON.
+
+------------------------------------------------------------
+WHEN TO REMEMBER
+------------------------------------------------------------
+
+Remember the message if it contains:
+
+1. A user preference.
+
+Examples:
+
+"I prefer TypeScript."
+"I like concise explanations."
+"I prefer dark mode."
+
+2. A stable fact about the user.
+
+Examples:
+
+"I mainly work with React."
+"I use VS Code for development."
+"I work mostly on frontend projects."
+
+3. A persistent instruction.
+
+Examples:
+
+"From now on, always explain programming concepts with examples."
+"Always use TypeScript in your examples."
+"Keep your answers concise."
+"Don't use overly complicated explanations."
+
+4. A change to an existing preference or workflow.
+
+Examples:
+
+"I've switched to TypeScript."
+"I no longer use JavaScript."
+"I now use VS Code."
+
+------------------------------------------------------------
+WHEN NOT TO REMEMBER
+------------------------------------------------------------
 
 Do NOT remember:
 
-- General questions
-- Temporary requests
+- General knowledge questions
+- One-time questions
 - Greetings
-- Thank-you messages
-- General knowledge
-- One-time tasks
-- Information that is not useful in future conversations
+- Thanks
+- Temporary requests
+- Requests to explain a topic
+- Questions about unrelated facts
+- Information that does not describe a durable user preference,
+  fact, or instruction
 
-If the information should NOT be remembered, return:
+Examples:
 
-{{
-    "remember": false,
-    "type": null,
-    "text": null,
-    "importance": 0
-}}
+"What is React?"
 
-If the information SHOULD be remembered, return:
+"What is the capital of France?"
 
-{{
-    "remember": true,
-    "type": "preference",
-    "text": "A concise normalized memory",
-    "importance": 0.8
-}}
+"How does Python work?"
 
-Allowed memory types:
+"Thanks!"
+
+"Can you explain recursion?"
+
+------------------------------------------------------------
+IMPORTANT NORMALIZATION RULE
+------------------------------------------------------------
+
+Convert the user's wording into a concise, reusable statement.
+
+For technology preferences, prefer wording such as:
+
+"User prefers TypeScript for projects."
+
+instead of:
+
+"User has switched exclusively to using TypeScript for
+their projects."
+
+For development facts:
+
+"User mainly works with React."
+
+For editor preferences:
+
+"User uses VS Code for development."
+
+For instructions:
+
+"User prefers programming concepts to be explained with
+simple examples."
+
+------------------------------------------------------------
+MEMORY TYPES
+------------------------------------------------------------
+
+Allowed types:
 
 - preference
 - fact
 - instruction
 
-The memory text must be written as a concise,
-third-person statement about the user.
+------------------------------------------------------------
+IMPORTANCE
+------------------------------------------------------------
+
+Use a value between 0 and 1.
 
 Examples:
 
-User:
-"I prefer TypeScript for my projects."
+0.9 = very important persistent preference/instruction
 
-Output:
+0.7 = useful long-term fact
+
+0.5 = relatively minor preference
+
+------------------------------------------------------------
+OUTPUT FORMAT
+------------------------------------------------------------
+
+If the message should be remembered:
 
 {{
     "remember": true,
@@ -486,34 +666,7 @@ Output:
     "importance": 0.8
 }}
 
-User:
-"I mainly work with React."
-
-Output:
-
-{{
-    "remember": true,
-    "type": "fact",
-    "text": "User mainly works with React.",
-    "importance": 0.7
-}}
-
-User:
-"From now on, keep your explanations concise."
-
-Output:
-
-{{
-    "remember": true,
-    "type": "instruction",
-    "text": "User prefers concise explanations.",
-    "importance": 0.8
-}}
-
-User:
-"What is React?"
-
-Output:
+If the message should be ignored:
 
 {{
     "remember": false,
@@ -522,38 +675,33 @@ Output:
     "importance": 0
 }}
 
-IMPORTANT:
-Return ONLY valid JSON.
-Do not include markdown.
-Do not include explanations.
+------------------------------------------------------------
 
-User message:
+USER MESSAGE:
 
 {user_message}
 """
 
-    response = ollama.chat(
-        model=LLM_MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-    )
-
-    raw_content = response["message"]["content"].strip()
-
     try:
+
+        response = ollama.chat(
+            model=LLM_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            format="json",
+        )
+
+        raw_content = response["message"]["content"].strip()
 
         parsed = json.loads(raw_content)
 
         candidate = MemoryCandidate(**parsed)
 
     except Exception:
-
-        # If the LLM returns malformed JSON,
-        # safely ignore the memory candidate.
 
         return MemoryCandidate(
             remember=False,
@@ -562,35 +710,50 @@ User message:
             importance=0.0,
         )
 
-    # --------------------------------------------------------
-    # Additional application-level validation
-    # --------------------------------------------------------
-
     allowed_types = {
         "preference",
         "fact",
         "instruction",
     }
 
-    if candidate.remember:
+    if not candidate.remember:
 
-        if candidate.type not in allowed_types:
-            return MemoryCandidate(
-                remember=False,
-                type=None,
-                text=None,
-                importance=0.0,
-            )
+        return MemoryCandidate(
+            remember=False,
+            type=None,
+            text=None,
+            importance=0.0,
+        )
 
-        if not candidate.text or not candidate.text.strip():
-            return MemoryCandidate(
-                remember=False,
-                type=None,
-                text=None,
-                importance=0.0,
-            )
+    if candidate.type not in allowed_types:
 
-    return candidate
+        return MemoryCandidate(
+            remember=False,
+            type=None,
+            text=None,
+            importance=0.0,
+        )
+
+    if not candidate.text or not candidate.text.strip():
+
+        return MemoryCandidate(
+            remember=False,
+            type=None,
+            text=None,
+            importance=0.0,
+        )
+
+    importance = max(
+        0.0,
+        min(1.0, candidate.importance),
+    )
+
+    return MemoryCandidate(
+        remember=True,
+        type=candidate.type,
+        text=candidate.text.strip(),
+        importance=importance,
+    )
 
 
 # ============================================================
@@ -735,31 +898,35 @@ Instructions:
     answer = response["message"]["content"]
 
     # --------------------------------------------------------
-    # 8. Analyze User Message For New Memory
+    # 8. Analyze User Message
     # --------------------------------------------------------
 
     memory_candidate = analyze_memory(request.query)
 
     # --------------------------------------------------------
-    # 9. Store Memory If Necessary
+    # 9. Duplicate Check + Store
     # --------------------------------------------------------
 
-    memory_stored = False
-    memory_id = None
+    memory_result = {
+        "memory_stored": False,
+        "memory_duplicate": False,
+        "memory_id": None,
+        "existing_memory_id": None,
+        "existing_memory_text": None,
+        "duplicate_score": None,
+    }
 
     if memory_candidate.remember:
 
-        memory_id = store_memory(
+        memory_result = store_memory_if_not_duplicate(
             text=memory_candidate.text,
             memory_type=memory_candidate.type,
             importance=memory_candidate.importance,
             source="conversation",
         )
 
-        memory_stored = True
-
     # --------------------------------------------------------
-    # 10. Response
+    # 10. Return Response
     # --------------------------------------------------------
 
     return {
@@ -774,6 +941,10 @@ Instructions:
             "text": memory_candidate.text,
             "importance": memory_candidate.importance,
         },
-        "memory_stored": memory_stored,
-        "memory_id": memory_id,
+        "memory_stored": memory_result["memory_stored"],
+        "memory_duplicate": memory_result["memory_duplicate"],
+        "memory_id": memory_result["memory_id"],
+        "existing_memory_id": memory_result["existing_memory_id"],
+        "existing_memory_text": memory_result["existing_memory_text"],
+        "duplicate_score": memory_result["duplicate_score"],
     }
