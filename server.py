@@ -1,5 +1,5 @@
 from fastapi import FastAPI, UploadFile, File
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
 from qdrant_client.models import VectorParams, Distance, PointStruct
 from sentence_transformers import SentenceTransformer
@@ -7,7 +7,8 @@ import uuid
 import ollama
 import pdfplumber
 import io
-import re
+import json
+from datetime import datetime, timezone
 
 app = FastAPI()
 
@@ -21,11 +22,10 @@ KNOWLEDGE_COLLECTION = "knowledge"
 
 VECTOR_SIZE = 384
 
-CHUNK_SIZE = 1000
-CHUNK_OVERLAP = 150
+DEFAULT_SCORE_THRESHOLD = 0.3
 
-# Initial threshold based on our retrieval testing.
-DEFAULT_SCORE_THRESHOLD = 0.30
+EMBEDDING_MODEL = "all-MiniLM-L6-v2"
+LLM_MODEL = "phi3:mini"
 
 
 # ============================================================
@@ -34,6 +34,7 @@ DEFAULT_SCORE_THRESHOLD = 0.30
 
 qdrant = QdrantClient(":memory:")
 
+
 qdrant.recreate_collection(
     collection_name=MEMORY_COLLECTION,
     vectors_config=VectorParams(
@@ -41,6 +42,7 @@ qdrant.recreate_collection(
         distance=Distance.COSINE,
     ),
 )
+
 
 qdrant.recreate_collection(
     collection_name=KNOWLEDGE_COLLECTION,
@@ -52,10 +54,10 @@ qdrant.recreate_collection(
 
 
 # ============================================================
-# Embedding Model
+# Embedding model
 # ============================================================
 
-model = SentenceTransformer("all-MiniLM-L6-v2")
+model = SentenceTransformer(EMBEDDING_MODEL)
 
 
 # ============================================================
@@ -70,22 +72,44 @@ class MemoryRequest(BaseModel):
 class SearchRequest(BaseModel):
     query: str
     limit: int = 3
-    score_threshold: float | None = None
+    score_threshold: float = DEFAULT_SCORE_THRESHOLD
 
 
 class ChatRequest(BaseModel):
     query: str
     top_k: int = 3
-    score_threshold: float | None = None
+    score_threshold: float = DEFAULT_SCORE_THRESHOLD
 
 
 # ============================================================
-# Embedding Helper
+# Memory Analyzer Model
+# ============================================================
+
+
+class MemoryCandidate(BaseModel):
+    remember: bool
+    type: str | None = None
+    text: str | None = None
+    importance: float = Field(default=0.0, ge=0.0, le=1.0)
+
+
+# ============================================================
+# Utility Functions
 # ============================================================
 
 
 def create_embedding(text: str):
+    """
+    Convert text into an embedding vector.
+    """
     return model.encode(text).tolist()
+
+
+def current_timestamp():
+    """
+    Return current UTC timestamp.
+    """
+    return datetime.now(timezone.utc).isoformat()
 
 
 # ============================================================
@@ -95,19 +119,27 @@ def create_embedding(text: str):
 
 def store_memory(
     text: str,
-    metadata: dict | None = None,
+    memory_type: str = "fact",
+    importance: float = 0.5,
+    source: str = "manual",
 ):
+    """
+    Store a memory in the memory collection.
+    """
+
     embedding = create_embedding(text)
 
     point_id = str(uuid.uuid4())
 
     payload = {
         "text": text,
-        "type": "memory",
+        "type": memory_type,
+        "importance": importance,
+        "source": source,
+        "created_at": current_timestamp(),
+        "updated_at": current_timestamp(),
+        "status": "active",
     }
-
-    if metadata:
-        payload.update(metadata)
 
     qdrant.upsert(
         collection_name=MEMORY_COLLECTION,
@@ -130,8 +162,14 @@ def store_memory(
 
 def store_knowledge(
     text: str,
-    metadata: dict | None = None,
+    file_name: str,
+    chunk_index: int,
+    page: int | None = None,
 ):
+    """
+    Store a knowledge chunk in the knowledge collection.
+    """
+
     embedding = create_embedding(text)
 
     point_id = str(uuid.uuid4())
@@ -139,10 +177,11 @@ def store_knowledge(
     payload = {
         "text": text,
         "type": "knowledge",
+        "file_name": file_name,
+        "page": page,
+        "chunk_index": chunk_index,
+        "created_at": current_timestamp(),
     }
-
-    if metadata:
-        payload.update(metadata)
 
     qdrant.upsert(
         collection_name=KNOWLEDGE_COLLECTION,
@@ -166,17 +205,19 @@ def store_knowledge(
 def search_memory(
     query: str,
     limit: int = 3,
-    score_threshold: float | None = None,
+    score_threshold: float = DEFAULT_SCORE_THRESHOLD,
 ):
-    query_embedding = create_embedding(query)
+    """
+    Search only the memory collection.
+    """
 
-    threshold = DEFAULT_SCORE_THRESHOLD if score_threshold is None else score_threshold
+    query_embedding = create_embedding(query)
 
     results = qdrant.query_points(
         collection_name=MEMORY_COLLECTION,
         query=query_embedding,
         limit=limit,
-        score_threshold=threshold,
+        score_threshold=score_threshold,
     )
 
     return results.points
@@ -190,213 +231,37 @@ def search_memory(
 def search_knowledge(
     query: str,
     limit: int = 3,
-    score_threshold: float | None = None,
+    score_threshold: float = DEFAULT_SCORE_THRESHOLD,
 ):
-    query_embedding = create_embedding(query)
+    """
+    Search only the knowledge collection.
+    """
 
-    threshold = DEFAULT_SCORE_THRESHOLD if score_threshold is None else score_threshold
+    query_embedding = create_embedding(query)
 
     results = qdrant.query_points(
         collection_name=KNOWLEDGE_COLLECTION,
         query=query_embedding,
         limit=limit,
-        score_threshold=threshold,
+        score_threshold=score_threshold,
     )
 
     return results.points
 
 
 # ============================================================
-# Text Chunking
-# ============================================================
-
-
-def split_large_text(
-    text: str,
-    chunk_size: int,
-):
-    chunks = []
-
-    start = 0
-
-    while start < len(text):
-
-        end = start + chunk_size
-
-        chunk = text[start:end].strip()
-
-        if chunk:
-            chunks.append(chunk)
-
-        start = end
-
-    return chunks
-
-
-def chunk_text(
-    text: str,
-    chunk_size: int = CHUNK_SIZE,
-    overlap: int = CHUNK_OVERLAP,
-):
-    text = text.replace("\r\n", "\n")
-    text = text.replace("\r", "\n")
-
-    paragraphs = [
-        paragraph.strip()
-        for paragraph in re.split(
-            r"\n\s*\n",
-            text,
-        )
-        if paragraph.strip()
-    ]
-
-    chunks = []
-    current = ""
-
-    for paragraph in paragraphs:
-
-        if len(paragraph) > chunk_size:
-
-            if current:
-                chunks.append(current.strip())
-                current = ""
-
-            large_chunks = split_large_text(
-                paragraph,
-                chunk_size,
-            )
-
-            chunks.extend(large_chunks)
-
-            continue
-
-        candidate = paragraph if not current else current + "\n\n" + paragraph
-
-        if len(candidate) <= chunk_size:
-
-            current = candidate
-
-        else:
-
-            if current:
-                chunks.append(current.strip())
-
-            overlap_text = ""
-
-            if overlap > 0 and current:
-                overlap_text = current[-overlap:]
-
-            current = overlap_text + "\n\n" + paragraph if overlap_text else paragraph
-
-    if current:
-        chunks.append(current.strip())
-
-    return chunks
-
-
-# ============================================================
-# PDF Extraction
-# ============================================================
-
-
-def extract_pdf_pages(content: bytes):
-
-    pages = []
-
-    with pdfplumber.open(io.BytesIO(content)) as pdf:
-
-        for page_number, page in enumerate(
-            pdf.pages,
-            start=1,
-        ):
-
-            page_text = page.extract_text()
-
-            if page_text and page_text.strip():
-
-                pages.append(
-                    {
-                        "page": page_number,
-                        "text": page_text.strip(),
-                    }
-                )
-
-    return pages
-
-
-# ============================================================
-# Text File Chunk Creation
-# ============================================================
-
-
-def create_text_chunks(text: str):
-
-    chunks = chunk_text(text)
-
-    results = []
-
-    for chunk_index, chunk in enumerate(chunks):
-
-        results.append(
-            {
-                "text": chunk,
-                "chunk_index": chunk_index,
-            }
-        )
-
-    return results
-
-
-# ============================================================
-# PDF Chunk Creation
-# ============================================================
-
-
-def create_pdf_chunks(content: bytes):
-
-    pages = extract_pdf_pages(content)
-
-    results = []
-
-    global_chunk_index = 0
-
-    for page_data in pages:
-
-        page_number = page_data["page"]
-        page_text = page_data["text"]
-
-        page_chunks = chunk_text(page_text)
-
-        for page_chunk_index, chunk in enumerate(page_chunks):
-
-            results.append(
-                {
-                    "text": chunk,
-                    "page": page_number,
-                    "chunk_index": global_chunk_index,
-                    "page_chunk_index": page_chunk_index,
-                }
-            )
-
-            global_chunk_index += 1
-
-    return results
-
-
-# ============================================================
-# /store
+# Manual Memory Endpoint
 # ============================================================
 
 
 @app.post("/store")
 def add_memory(request: MemoryRequest):
 
-    if not request.text.strip():
-
-        return {"error": "Memory text cannot be empty"}
-
     point_id = store_memory(
         text=request.text,
+        memory_type="memory",
+        importance=0.5,
+        source="manual",
     )
 
     return {
@@ -407,50 +272,33 @@ def add_memory(request: MemoryRequest):
 
 
 # ============================================================
-# /add_memory_file_upload
+# Knowledge File Upload
 # ============================================================
 
 
 @app.post("/add_memory_file_upload")
-async def add_memory_file_upload(
-    file: UploadFile = File(...),
-):
-
-    if not file.filename:
-
-        return {"error": "Filename is required"}
-
-    filename = file.filename.lower()
+async def add_memory_file_upload(file: UploadFile = File(...)):
 
     content = await file.read()
 
-    stored_ids = []
+    file_name = file.filename or "unknown"
+
+    text = ""
 
     # --------------------------------------------------------
     # PDF
     # --------------------------------------------------------
 
-    if filename.endswith(".pdf"):
+    if file_name.lower().endswith(".pdf"):
 
-        chunks = create_pdf_chunks(content)
+        with pdfplumber.open(io.BytesIO(content)) as pdf:
 
-        if not chunks:
+            for page in pdf.pages:
 
-            return {"error": "PDF contains no extractable text"}
+                page_text = page.extract_text()
 
-        for chunk_data in chunks:
-
-            point_id = store_knowledge(
-                text=chunk_data["text"],
-                metadata={
-                    "file_name": file.filename,
-                    "page": chunk_data["page"],
-                    "chunk_index": chunk_data["chunk_index"],
-                    "page_chunk_index": chunk_data["page_chunk_index"],
-                },
-            )
-
-            stored_ids.append(point_id)
+                if page_text:
+                    text += page_text + "\n"
 
     # --------------------------------------------------------
     # Text
@@ -459,101 +307,93 @@ async def add_memory_file_upload(
     else:
 
         try:
-
             text = content.decode("utf-8")
 
         except UnicodeDecodeError:
 
-            return {"error": ("File must be a UTF-8 text file " "or PDF")}
+            return {"error": "File must be a text or PDF file"}
 
-        if not text.strip():
+    # --------------------------------------------------------
+    # Empty file
+    # --------------------------------------------------------
 
-            return {"error": "File is empty"}
+    if not text.strip():
 
-        chunks = create_text_chunks(text)
+        return {"error": "File is empty"}
 
-        for chunk_data in chunks:
+    # --------------------------------------------------------
+    # Simple chunking
+    # --------------------------------------------------------
 
-            point_id = store_knowledge(
-                text=chunk_data["text"],
-                metadata={
-                    "file_name": file.filename,
-                    "chunk_index": chunk_data["chunk_index"],
-                },
-            )
+    chunks = [text[i : i + 1000] for i in range(0, len(text), 1000)]
 
-            stored_ids.append(point_id)
+    stored_ids = []
+
+    for chunk_index, chunk in enumerate(chunks):
+
+        point_id = store_knowledge(
+            text=chunk,
+            file_name=file_name,
+            chunk_index=chunk_index,
+        )
+
+        stored_ids.append(point_id)
 
     return {
         "status": "stored",
         "collection": KNOWLEDGE_COLLECTION,
-        "file_name": file.filename,
-        "chunks_stored": len(stored_ids),
+        "file_name": file_name,
+        "chunks_stored": len(chunks),
         "ids": stored_ids,
     }
 
 
 # ============================================================
-# /search_memory
+# Search Memory Endpoint
 # ============================================================
 
 
 @app.post("/search_memory")
-def search_memory_endpoint(
-    request: SearchRequest,
-):
+def search_memory_endpoint(request: SearchRequest):
 
-    threshold = (
-        DEFAULT_SCORE_THRESHOLD
-        if request.score_threshold is None
-        else request.score_threshold
-    )
-
-    points = search_memory(
+    results = search_memory(
         query=request.query,
         limit=request.limit,
-        score_threshold=threshold,
+        score_threshold=request.score_threshold,
     )
 
     return {
         "collection": MEMORY_COLLECTION,
-        "score_threshold": threshold,
+        "score_threshold": request.score_threshold,
         "results": [
             {
                 "text": point.payload.get("text"),
                 "type": point.payload.get("type"),
+                "importance": point.payload.get("importance"),
                 "score": float(point.score),
             }
-            for point in points
+            for point in results
         ],
     }
 
 
 # ============================================================
-# /search_knowledge
+# Search Knowledge Endpoint
 # ============================================================
 
 
 @app.post("/search_knowledge")
-def search_knowledge_endpoint(
-    request: SearchRequest,
-):
+def search_knowledge_endpoint(request: SearchRequest):
 
-    threshold = (
-        DEFAULT_SCORE_THRESHOLD
-        if request.score_threshold is None
-        else request.score_threshold
-    )
-
-    points = search_knowledge(
+    results = search_knowledge(
         query=request.query,
         limit=request.limit,
-        score_threshold=threshold,
+        score_threshold=request.score_threshold,
     )
 
     return {
         "collection": KNOWLEDGE_COLLECTION,
-        "score_threshold": threshold,
+        "score_threshold": request.score_threshold,
         "results": [
             {
                 "text": point.payload.get("text"),
@@ -561,161 +401,139 @@ def search_knowledge_endpoint(
                 "file_name": point.payload.get("file_name"),
                 "page": point.payload.get("page"),
                 "chunk_index": point.payload.get("chunk_index"),
-                "page_chunk_index": point.payload.get("page_chunk_index"),
                 "score": float(point.score),
             }
-            for point in points
+            for point in results
         ],
     }
 
 
 # ============================================================
-# /chat
+# Memory Analyzer
 # ============================================================
 
 
-@app.post("/chat")
-def chat(request: ChatRequest):
-
-    threshold = (
-        DEFAULT_SCORE_THRESHOLD
-        if request.score_threshold is None
-        else request.score_threshold
-    )
-
-    # --------------------------------------------------------
-    # Search Memory
-    # --------------------------------------------------------
-
-    memory_points = search_memory(
-        query=request.query,
-        limit=request.top_k,
-        score_threshold=threshold,
-    )
-
-    # --------------------------------------------------------
-    # Search Knowledge
-    # --------------------------------------------------------
-
-    knowledge_points = search_knowledge(
-        query=request.query,
-        limit=request.top_k,
-        score_threshold=threshold,
-    )
-
-    # --------------------------------------------------------
-    # Build Memory Context
-    # --------------------------------------------------------
-
-    memory_context_parts = []
-
-    for point in memory_points:
-
-        text = point.payload.get(
-            "text",
-            "",
-        )
-
-        score = float(point.score)
-
-        memory_context_parts.append(f"[Score: {score:.3f}]\n{text}")
-
-    memory_context = (
-        "\n---\n".join(memory_context_parts)
-        if memory_context_parts
-        else "No relevant memory found."
-    )
-
-    # --------------------------------------------------------
-    # Build Knowledge Context
-    # --------------------------------------------------------
-
-    knowledge_context_parts = []
-
-    for point in knowledge_points:
-
-        text = point.payload.get(
-            "text",
-            "",
-        )
-
-        score = float(point.score)
-
-        metadata = []
-
-        if point.payload.get("file_name"):
-
-            metadata.append(f"File: {point.payload['file_name']}")
-
-        if point.payload.get("page") is not None:
-
-            metadata.append(f"Page: {point.payload['page']}")
-
-        if point.payload.get("chunk_index") is not None:
-
-            metadata.append(f"Chunk: {point.payload['chunk_index']}")
-
-        metadata_text = ""
-
-        if metadata:
-
-            metadata_text = "\n" + " | ".join(metadata)
-
-        knowledge_context_parts.append(
-            f"[Score: {score:.3f}]" f"{metadata_text}\n" f"{text}"
-        )
-
-    knowledge_context = (
-        "\n---\n".join(knowledge_context_parts)
-        if knowledge_context_parts
-        else "No relevant knowledge found."
-    )
-
-    # --------------------------------------------------------
-    # Combined Context
-    # --------------------------------------------------------
-
-    context = f"""
---- User Memory ---
-{memory_context}
-
---- Knowledge ---
-{knowledge_context}
-"""
-
-    # --------------------------------------------------------
-    # Prompt
-    # --------------------------------------------------------
+def analyze_memory(user_message: str) -> MemoryCandidate:
+    """
+    Ask Phi-3 whether the user's message contains
+    information worth remembering.
+    """
 
     prompt = f"""
-You are a helpful AI assistant.
+You are a memory extraction system.
 
-Use the provided memory and knowledge context
-when it is relevant to the user's question.
+Analyze the user's message below.
 
---- Context ---
-{context}
---- End Context ---
+Your job is to determine whether the user has provided
+information that should be remembered for future conversations.
 
-Question:
-{request.query}
+Remember information such as:
 
-Instructions:
-- Use relevant user memory when it helps.
-- Use relevant knowledge when it helps.
-- Do not assume that every retrieved item is relevant.
-- If the context does not contain the answer, use your
-  general knowledge when appropriate.
-- Do not invent information from the context.
-- Keep your answer concise and natural.
+- User preferences
+- Stable user facts
+- Long-term instructions
+- Technology or workflow preferences
+- Things the user explicitly wants the assistant to remember
+
+Do NOT remember:
+
+- General questions
+- Temporary requests
+- Greetings
+- Thank-you messages
+- General knowledge
+- One-time tasks
+- Information that is not useful in future conversations
+
+If the information should NOT be remembered, return:
+
+{{
+    "remember": false,
+    "type": null,
+    "text": null,
+    "importance": 0
+}}
+
+If the information SHOULD be remembered, return:
+
+{{
+    "remember": true,
+    "type": "preference",
+    "text": "A concise normalized memory",
+    "importance": 0.8
+}}
+
+Allowed memory types:
+
+- preference
+- fact
+- instruction
+
+The memory text must be written as a concise,
+third-person statement about the user.
+
+Examples:
+
+User:
+"I prefer TypeScript for my projects."
+
+Output:
+
+{{
+    "remember": true,
+    "type": "preference",
+    "text": "User prefers TypeScript for projects.",
+    "importance": 0.8
+}}
+
+User:
+"I mainly work with React."
+
+Output:
+
+{{
+    "remember": true,
+    "type": "fact",
+    "text": "User mainly works with React.",
+    "importance": 0.7
+}}
+
+User:
+"From now on, keep your explanations concise."
+
+Output:
+
+{{
+    "remember": true,
+    "type": "instruction",
+    "text": "User prefers concise explanations.",
+    "importance": 0.8
+}}
+
+User:
+"What is React?"
+
+Output:
+
+{{
+    "remember": false,
+    "type": null,
+    "text": null,
+    "importance": 0
+}}
+
+IMPORTANT:
+Return ONLY valid JSON.
+Do not include markdown.
+Do not include explanations.
+
+User message:
+
+{user_message}
 """
 
-    # --------------------------------------------------------
-    # LLM
-    # --------------------------------------------------------
-
     response = ollama.chat(
-        model="phi3:mini",
+        model=LLM_MODEL,
         messages=[
             {
                 "role": "user",
@@ -724,10 +542,238 @@ Instructions:
         ],
     )
 
+    raw_content = response["message"]["content"].strip()
+
+    try:
+
+        parsed = json.loads(raw_content)
+
+        candidate = MemoryCandidate(**parsed)
+
+    except Exception:
+
+        # If the LLM returns malformed JSON,
+        # safely ignore the memory candidate.
+
+        return MemoryCandidate(
+            remember=False,
+            type=None,
+            text=None,
+            importance=0.0,
+        )
+
+    # --------------------------------------------------------
+    # Additional application-level validation
+    # --------------------------------------------------------
+
+    allowed_types = {
+        "preference",
+        "fact",
+        "instruction",
+    }
+
+    if candidate.remember:
+
+        if candidate.type not in allowed_types:
+            return MemoryCandidate(
+                remember=False,
+                type=None,
+                text=None,
+                importance=0.0,
+            )
+
+        if not candidate.text or not candidate.text.strip():
+            return MemoryCandidate(
+                remember=False,
+                type=None,
+                text=None,
+                importance=0.0,
+            )
+
+    return candidate
+
+
+# ============================================================
+# Chat Endpoint
+# ============================================================
+
+
+@app.post("/chat")
+def chat(request: ChatRequest):
+
+    # --------------------------------------------------------
+    # 1. Retrieve Memory
+    # --------------------------------------------------------
+
+    memory_results = search_memory(
+        query=request.query,
+        limit=request.top_k,
+        score_threshold=request.score_threshold,
+    )
+
+    # --------------------------------------------------------
+    # 2. Retrieve Knowledge
+    # --------------------------------------------------------
+
+    knowledge_results = search_knowledge(
+        query=request.query,
+        limit=request.top_k,
+        score_threshold=request.score_threshold,
+    )
+
+    # --------------------------------------------------------
+    # 3. Build Memory Context
+    # --------------------------------------------------------
+
+    memory_context_parts = []
+
+    for point in memory_results:
+
+        part = f"[Score: {point.score:.3f}]\n" f"{point.payload.get('text', '')}"
+
+        memory_context_parts.append(part)
+
+    if memory_context_parts:
+
+        memory_context = "\n---\n".join(memory_context_parts)
+
+    else:
+
+        memory_context = "No relevant memory found."
+
+    # --------------------------------------------------------
+    # 4. Build Knowledge Context
+    # --------------------------------------------------------
+
+    knowledge_context_parts = []
+
+    for point in knowledge_results:
+
+        part = f"[Score: {point.score:.3f}]\n"
+
+        if point.payload.get("file_name"):
+
+            part += f"File: " f"{point.payload['file_name']}"
+
+        if point.payload.get("page") is not None:
+
+            part += f" | Page: " f"{point.payload['page']}"
+
+        if point.payload.get("chunk_index") is not None:
+
+            part += f" | Chunk: " f"{point.payload['chunk_index']}"
+
+        part += f"\n{point.payload.get('text', '')}"
+
+        knowledge_context_parts.append(part)
+
+    if knowledge_context_parts:
+
+        knowledge_context = "\n---\n".join(knowledge_context_parts)
+
+    else:
+
+        knowledge_context = "No relevant knowledge found."
+
+    # --------------------------------------------------------
+    # 5. Combined Context
+    # --------------------------------------------------------
+
+    context = (
+        "\n--- User Memory ---\n"
+        f"{memory_context}\n"
+        "\n--- Knowledge ---\n"
+        f"{knowledge_context}\n"
+    )
+
+    # --------------------------------------------------------
+    # 6. Main LLM Prompt
+    # --------------------------------------------------------
+
+    prompt = f"""
+You are a helpful AI assistant.
+
+Use the provided memory and knowledge when they
+are relevant to the user's question.
+
+--- User Memory ---
+{memory_context}
+
+--- Knowledge ---
+{knowledge_context}
+
+--- End Context ---
+
+Question:
+{request.query}
+
+Instructions:
+
+- Use relevant memory when answering.
+- Use relevant knowledge when answering.
+- Do not mention the retrieval system.
+- Do not invent information.
+- If the context does not contain the answer,
+  use your general knowledge when appropriate.
+- Keep the answer concise and natural.
+"""
+
+    # --------------------------------------------------------
+    # 7. Generate Answer
+    # --------------------------------------------------------
+
+    response = ollama.chat(
+        model=LLM_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+    )
+
+    answer = response["message"]["content"]
+
+    # --------------------------------------------------------
+    # 8. Analyze User Message For New Memory
+    # --------------------------------------------------------
+
+    memory_candidate = analyze_memory(request.query)
+
+    # --------------------------------------------------------
+    # 9. Store Memory If Necessary
+    # --------------------------------------------------------
+
+    memory_stored = False
+    memory_id = None
+
+    if memory_candidate.remember:
+
+        memory_id = store_memory(
+            text=memory_candidate.text,
+            memory_type=memory_candidate.type,
+            importance=memory_candidate.importance,
+            source="conversation",
+        )
+
+        memory_stored = True
+
+    # --------------------------------------------------------
+    # 10. Response
+    # --------------------------------------------------------
+
     return {
-        "response": response["message"]["content"],
-        "score_threshold": threshold,
-        "memory_results": len(memory_points),
-        "knowledge_results": len(knowledge_points),
+        "response": answer,
+        "score_threshold": request.score_threshold,
+        "memory_results": len(memory_results),
+        "knowledge_results": len(knowledge_results),
         "context_used": context,
+        "memory_analysis": {
+            "remember": memory_candidate.remember,
+            "type": memory_candidate.type,
+            "text": memory_candidate.text,
+            "importance": memory_candidate.importance,
+        },
+        "memory_stored": memory_stored,
+        "memory_id": memory_id,
     }
