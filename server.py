@@ -24,8 +24,7 @@ VECTOR_SIZE = 384
 CHUNK_SIZE = 1000
 CHUNK_OVERLAP = 150
 
-# Initial threshold based on our score evaluation.
-# This is NOT considered the final universal threshold.
+# Initial threshold based on our retrieval testing.
 DEFAULT_SCORE_THRESHOLD = 0.30
 
 
@@ -35,7 +34,6 @@ DEFAULT_SCORE_THRESHOLD = 0.30
 
 qdrant = QdrantClient(":memory:")
 
-
 qdrant.recreate_collection(
     collection_name=MEMORY_COLLECTION,
     vectors_config=VectorParams(
@@ -43,7 +41,6 @@ qdrant.recreate_collection(
         distance=Distance.COSINE,
     ),
 )
-
 
 qdrant.recreate_collection(
     collection_name=KNOWLEDGE_COLLECTION,
@@ -73,15 +70,13 @@ class MemoryRequest(BaseModel):
 class SearchRequest(BaseModel):
     query: str
     limit: int = 3
-
-    # Optional so we can experiment with different thresholds.
-    # If omitted, DEFAULT_SCORE_THRESHOLD is used.
     score_threshold: float | None = None
 
 
 class ChatRequest(BaseModel):
     query: str
     top_k: int = 3
+    score_threshold: float | None = None
 
 
 # ============================================================
@@ -90,9 +85,6 @@ class ChatRequest(BaseModel):
 
 
 def create_embedding(text: str):
-    """
-    Convert text into a vector using SentenceTransformer.
-    """
     return model.encode(text).tolist()
 
 
@@ -101,11 +93,10 @@ def create_embedding(text: str):
 # ============================================================
 
 
-def store_memory(text: str, metadata: dict | None = None):
-    """
-    Store a single memory in the memory collection.
-    """
-
+def store_memory(
+    text: str,
+    metadata: dict | None = None,
+):
     embedding = create_embedding(text)
 
     point_id = str(uuid.uuid4())
@@ -137,11 +128,10 @@ def store_memory(text: str, metadata: dict | None = None):
 # ============================================================
 
 
-def store_knowledge(text: str, metadata: dict | None = None):
-    """
-    Store a single knowledge chunk in the knowledge collection.
-    """
-
+def store_knowledge(
+    text: str,
+    metadata: dict | None = None,
+):
     embedding = create_embedding(text)
 
     point_id = str(uuid.uuid4())
@@ -178,12 +168,6 @@ def search_memory(
     limit: int = 3,
     score_threshold: float | None = None,
 ):
-    """
-    Search only the memory collection.
-
-    Qdrant filters results using score_threshold.
-    """
-
     query_embedding = create_embedding(query)
 
     threshold = DEFAULT_SCORE_THRESHOLD if score_threshold is None else score_threshold
@@ -208,12 +192,6 @@ def search_knowledge(
     limit: int = 3,
     score_threshold: float | None = None,
 ):
-    """
-    Search only the knowledge collection.
-
-    Qdrant filters results using score_threshold.
-    """
-
     query_embedding = create_embedding(query)
 
     threshold = DEFAULT_SCORE_THRESHOLD if score_threshold is None else score_threshold
@@ -233,16 +211,16 @@ def search_knowledge(
 # ============================================================
 
 
-def split_large_text(text: str, chunk_size: int):
-    """
-    Split a very large piece of text into smaller pieces.
-    """
-
+def split_large_text(
+    text: str,
+    chunk_size: int,
+):
     chunks = []
 
     start = 0
 
     while start < len(text):
+
         end = start + chunk_size
 
         chunk = text[start:end].strip()
@@ -260,19 +238,15 @@ def chunk_text(
     chunk_size: int = CHUNK_SIZE,
     overlap: int = CHUNK_OVERLAP,
 ):
-    """
-    Paragraph-aware chunking.
-
-    Tries to keep paragraphs together while respecting
-    the approximate chunk size.
-    """
-
     text = text.replace("\r\n", "\n")
     text = text.replace("\r", "\n")
 
     paragraphs = [
         paragraph.strip()
-        for paragraph in re.split(r"\n\s*\n", text)
+        for paragraph in re.split(
+            r"\n\s*\n",
+            text,
+        )
         if paragraph.strip()
     ]
 
@@ -281,8 +255,6 @@ def chunk_text(
 
     for paragraph in paragraphs:
 
-        # If a paragraph itself is larger than the target size,
-        # split it separately.
         if len(paragraph) > chunk_size:
 
             if current:
@@ -309,7 +281,6 @@ def chunk_text(
             if current:
                 chunks.append(current.strip())
 
-            # Add overlap from the previous chunk.
             overlap_text = ""
 
             if overlap > 0 and current:
@@ -329,25 +300,15 @@ def chunk_text(
 
 
 def extract_pdf_pages(content: bytes):
-    """
-    Extract PDF text page by page.
-
-    Returns:
-
-    [
-        {
-            "page": 1,
-            "text": "..."
-        },
-        ...
-    ]
-    """
 
     pages = []
 
     with pdfplumber.open(io.BytesIO(content)) as pdf:
 
-        for page_number, page in enumerate(pdf.pages, start=1):
+        for page_number, page in enumerate(
+            pdf.pages,
+            start=1,
+        ):
 
             page_text = page.extract_text()
 
@@ -369,9 +330,6 @@ def extract_pdf_pages(content: bytes):
 
 
 def create_text_chunks(text: str):
-    """
-    Create knowledge chunks for a text file.
-    """
 
     chunks = chunk_text(text)
 
@@ -395,11 +353,6 @@ def create_text_chunks(text: str):
 
 
 def create_pdf_chunks(content: bytes):
-    """
-    Extract PDF page by page and chunk each page independently.
-
-    Chunks do not intentionally cross page boundaries.
-    """
 
     pages = extract_pdf_pages(content)
 
@@ -439,6 +392,7 @@ def create_pdf_chunks(content: bytes):
 def add_memory(request: MemoryRequest):
 
     if not request.text.strip():
+
         return {"error": "Memory text cannot be empty"}
 
     point_id = store_memory(
@@ -463,6 +417,7 @@ async def add_memory_file_upload(
 ):
 
     if not file.filename:
+
         return {"error": "Filename is required"}
 
     filename = file.filename.lower()
@@ -480,6 +435,7 @@ async def add_memory_file_upload(
         chunks = create_pdf_chunks(content)
 
         if not chunks:
+
             return {"error": "PDF contains no extractable text"}
 
         for chunk_data in chunks:
@@ -503,13 +459,15 @@ async def add_memory_file_upload(
     else:
 
         try:
+
             text = content.decode("utf-8")
 
         except UnicodeDecodeError:
 
-            return {"error": "File must be a UTF-8 text file or PDF"}
+            return {"error": ("File must be a UTF-8 text file " "or PDF")}
 
         if not text.strip():
+
             return {"error": "File is empty"}
 
         chunks = create_text_chunks(text)
@@ -541,21 +499,25 @@ async def add_memory_file_upload(
 
 
 @app.post("/search_memory")
-def search_memory_endpoint(request: SearchRequest):
+def search_memory_endpoint(
+    request: SearchRequest,
+):
+
+    threshold = (
+        DEFAULT_SCORE_THRESHOLD
+        if request.score_threshold is None
+        else request.score_threshold
+    )
 
     points = search_memory(
         query=request.query,
         limit=request.limit,
-        score_threshold=request.score_threshold,
+        score_threshold=threshold,
     )
 
     return {
         "collection": MEMORY_COLLECTION,
-        "score_threshold": (
-            DEFAULT_SCORE_THRESHOLD
-            if request.score_threshold is None
-            else request.score_threshold
-        ),
+        "score_threshold": threshold,
         "results": [
             {
                 "text": point.payload.get("text"),
@@ -573,21 +535,25 @@ def search_memory_endpoint(request: SearchRequest):
 
 
 @app.post("/search_knowledge")
-def search_knowledge_endpoint(request: SearchRequest):
+def search_knowledge_endpoint(
+    request: SearchRequest,
+):
+
+    threshold = (
+        DEFAULT_SCORE_THRESHOLD
+        if request.score_threshold is None
+        else request.score_threshold
+    )
 
     points = search_knowledge(
         query=request.query,
         limit=request.limit,
-        score_threshold=request.score_threshold,
+        score_threshold=threshold,
     )
 
     return {
         "collection": KNOWLEDGE_COLLECTION,
-        "score_threshold": (
-            DEFAULT_SCORE_THRESHOLD
-            if request.score_threshold is None
-            else request.score_threshold
-        ),
+        "score_threshold": threshold,
         "results": [
             {
                 "text": point.payload.get("text"),
@@ -611,55 +577,142 @@ def search_knowledge_endpoint(request: SearchRequest):
 @app.post("/chat")
 def chat(request: ChatRequest):
 
-    # --------------------------------------------------------
-    # NOTE:
-    # /chat is intentionally still using the existing
-    # memory-only retrieval behavior.
-    #
-    # We will update /chat after threshold retrieval has
-    # been independently tested.
-    # --------------------------------------------------------
-
-    query_embedding = create_embedding(request.query)
-
-    results = qdrant.query_points(
-        collection_name=MEMORY_COLLECTION,
-        query=query_embedding,
-        limit=request.top_k,
+    threshold = (
+        DEFAULT_SCORE_THRESHOLD
+        if request.score_threshold is None
+        else request.score_threshold
     )
 
-    context_parts = []
+    # --------------------------------------------------------
+    # Search Memory
+    # --------------------------------------------------------
 
-    for point in results.points:
+    memory_points = search_memory(
+        query=request.query,
+        limit=request.top_k,
+        score_threshold=threshold,
+    )
 
-        part = point.payload.get("text", "")
+    # --------------------------------------------------------
+    # Search Knowledge
+    # --------------------------------------------------------
+
+    knowledge_points = search_knowledge(
+        query=request.query,
+        limit=request.top_k,
+        score_threshold=threshold,
+    )
+
+    # --------------------------------------------------------
+    # Build Memory Context
+    # --------------------------------------------------------
+
+    memory_context_parts = []
+
+    for point in memory_points:
+
+        text = point.payload.get(
+            "text",
+            "",
+        )
+
+        score = float(point.score)
+
+        memory_context_parts.append(f"[Score: {score:.3f}]\n{text}")
+
+    memory_context = (
+        "\n---\n".join(memory_context_parts)
+        if memory_context_parts
+        else "No relevant memory found."
+    )
+
+    # --------------------------------------------------------
+    # Build Knowledge Context
+    # --------------------------------------------------------
+
+    knowledge_context_parts = []
+
+    for point in knowledge_points:
+
+        text = point.payload.get(
+            "text",
+            "",
+        )
+
+        score = float(point.score)
+
+        metadata = []
 
         if point.payload.get("file_name"):
-            part += f"\nFile: " f"{point.payload['file_name']}"
 
-        context_parts.append(part)
+            metadata.append(f"File: {point.payload['file_name']}")
 
-    context = (
-        "\n---\n".join(context_parts) if context_parts else "No relevant memory found."
+        if point.payload.get("page") is not None:
+
+            metadata.append(f"Page: {point.payload['page']}")
+
+        if point.payload.get("chunk_index") is not None:
+
+            metadata.append(f"Chunk: {point.payload['chunk_index']}")
+
+        metadata_text = ""
+
+        if metadata:
+
+            metadata_text = "\n" + " | ".join(metadata)
+
+        knowledge_context_parts.append(
+            f"[Score: {score:.3f}]" f"{metadata_text}\n" f"{text}"
+        )
+
+    knowledge_context = (
+        "\n---\n".join(knowledge_context_parts)
+        if knowledge_context_parts
+        else "No relevant knowledge found."
     )
+
+    # --------------------------------------------------------
+    # Combined Context
+    # --------------------------------------------------------
+
+    context = f"""
+--- User Memory ---
+{memory_context}
+
+--- Knowledge ---
+{knowledge_context}
+"""
+
+    # --------------------------------------------------------
+    # Prompt
+    # --------------------------------------------------------
 
     prompt = f"""
 You are a helpful AI assistant.
 
-Use the following relevant information to answer
-the user's question.
+Use the provided memory and knowledge context
+when it is relevant to the user's question.
 
---- Memory context ---
+--- Context ---
 {context}
---- End of memory context ---
+--- End Context ---
 
-Question: {request.query}
+Question:
+{request.query}
 
 Instructions:
-- Use memory if it helps.
-- If memory is not relevant, answer based on general knowledge.
+- Use relevant user memory when it helps.
+- Use relevant knowledge when it helps.
+- Do not assume that every retrieved item is relevant.
+- If the context does not contain the answer, use your
+  general knowledge when appropriate.
+- Do not invent information from the context.
 - Keep your answer concise and natural.
 """
+
+    # --------------------------------------------------------
+    # LLM
+    # --------------------------------------------------------
 
     response = ollama.chat(
         model="phi3:mini",
@@ -673,5 +726,8 @@ Instructions:
 
     return {
         "response": response["message"]["content"],
+        "score_threshold": threshold,
+        "memory_results": len(memory_points),
+        "knowledge_results": len(knowledge_points),
         "context_used": context,
     }
