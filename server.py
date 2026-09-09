@@ -1,7 +1,14 @@
 from fastapi import FastAPI, UploadFile, File
 from pydantic import BaseModel, Field
 from qdrant_client import QdrantClient
-from qdrant_client.models import VectorParams, Distance, PointStruct
+from qdrant_client.models import (
+    VectorParams,
+    Distance,
+    PointStruct,
+    Filter,
+    FieldCondition,
+    MatchValue,
+)
 from sentence_transformers import SentenceTransformer
 import uuid
 import ollama
@@ -25,8 +32,14 @@ VECTOR_SIZE = 384
 # Used when retrieving information for answering questions
 DEFAULT_SCORE_THRESHOLD = 0.3
 
-# Used only when checking whether a new memory is a duplicate
+# Used when finding potentially related memories
+MEMORY_RELATIONSHIP_THRESHOLD = 0.5
+
+# Used specifically for duplicate detection
 MEMORY_DUPLICATE_THRESHOLD = 0.75
+
+# Number of related memories inspected by the memory manager
+MEMORY_RELATIONSHIP_LIMIT = 5
 
 EMBEDDING_MODEL = "all-MiniLM-L6-v2"
 LLM_MODEL = "phi3:mini"
@@ -83,6 +96,69 @@ class ChatRequest(BaseModel):
     score_threshold: float = DEFAULT_SCORE_THRESHOLD
 
 
+class ConflictDetectionRequest(BaseModel):
+    new_memory: str
+    existing_memory: str
+
+
+class MemoryRelationshipRequest(BaseModel):
+    new_memory: str
+    existing_memory: str
+
+
+class MemoryUpdateRequest(BaseModel):
+    memory_id: str
+    text: str
+    memory_type: str = "fact"
+    importance: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+    )
+
+
+class SupersedeMemoryRequest(BaseModel):
+    old_memory_id: str
+    new_memory_id: str
+
+
+class ProcessMemoryRequest(BaseModel):
+    text: str
+    memory_type: str = "fact"
+    importance: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+    )
+    source: str = "conversation"
+
+
+# ============================================================
+# Response Models
+# ============================================================
+
+
+class ConflictDetectionResult(BaseModel):
+    conflict: bool
+    reason: str = ""
+
+
+class MemoryRelationshipResult(BaseModel):
+    relationship: str
+    reason: str = ""
+
+
+class MemoryUpdateResult(BaseModel):
+    memory_id: str
+    text: str
+    type: str
+    importance: float
+    created_at: str
+    updated_at: str
+    status: str
+    supersedes: str | None = None
+
+
 # ============================================================
 # Memory Analyzer Model
 # ============================================================
@@ -128,6 +204,7 @@ def store_memory(
     memory_type: str = "fact",
     importance: float = 0.5,
     source: str = "manual",
+    supersedes: str | None = None,
 ):
     """
     Store a memory in the memory collection.
@@ -147,6 +224,7 @@ def store_memory(
         "created_at": timestamp,
         "updated_at": timestamp,
         "status": "active",
+        "supersedes": supersedes,
     }
 
     qdrant.upsert(
@@ -161,6 +239,189 @@ def store_memory(
     )
 
     return point_id
+
+
+# ============================================================
+# Memory Update
+# ============================================================
+
+
+def update_memory(
+    memory_id: str,
+    text: str,
+    memory_type: str,
+    importance: float,
+):
+    """
+    Update an existing active memory.
+
+    The existing memory ID is preserved.
+
+    created_at is preserved.
+    updated_at is changed.
+    status remains active.
+    supersedes is preserved.
+
+    The vector is regenerated because the text has changed.
+    """
+
+    results = qdrant.retrieve(
+        collection_name=MEMORY_COLLECTION,
+        ids=[memory_id],
+        with_payload=True,
+        with_vectors=False,
+    )
+
+    if not results:
+        raise ValueError(f"Memory '{memory_id}' was not found.")
+
+    existing_point = results[0]
+    existing_payload = existing_point.payload or {}
+
+    if existing_payload.get("status") != "active":
+        raise ValueError(f"Memory '{memory_id}' is not active and cannot be updated.")
+
+    created_at = existing_payload.get(
+        "created_at",
+        current_timestamp(),
+    )
+
+    supersedes = existing_payload.get("supersedes")
+
+    updated_at = current_timestamp()
+
+    embedding = create_embedding(text)
+
+    payload = {
+        "text": text,
+        "type": memory_type,
+        "importance": importance,
+        "source": existing_payload.get(
+            "source",
+            "conversation",
+        ),
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "status": "active",
+        "supersedes": supersedes,
+    }
+
+    qdrant.upsert(
+        collection_name=MEMORY_COLLECTION,
+        points=[
+            PointStruct(
+                id=memory_id,
+                vector=embedding,
+                payload=payload,
+            )
+        ],
+    )
+
+    return {
+        "memory_id": memory_id,
+        "text": text,
+        "type": memory_type,
+        "importance": importance,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "status": "active",
+        "supersedes": supersedes,
+    }
+
+
+# ============================================================
+# Supersede Memory
+# ============================================================
+
+
+def supersede_memory(
+    old_memory_id: str,
+    new_memory_id: str,
+):
+    """
+    Mark an existing memory as superseded and connect the
+    new memory to the old memory.
+    """
+
+    if old_memory_id == new_memory_id:
+        raise ValueError("Old and new memory IDs must be different.")
+
+    old_results = qdrant.retrieve(
+        collection_name=MEMORY_COLLECTION,
+        ids=[old_memory_id],
+        with_payload=True,
+        with_vectors=False,
+    )
+
+    if not old_results:
+        raise ValueError(f"Old memory '{old_memory_id}' was not found.")
+
+    new_results = qdrant.retrieve(
+        collection_name=MEMORY_COLLECTION,
+        ids=[new_memory_id],
+        with_payload=True,
+        with_vectors=False,
+    )
+
+    if not new_results:
+        raise ValueError(f"New memory '{new_memory_id}' was not found.")
+
+    old_point = old_results[0]
+    new_point = new_results[0]
+
+    old_payload = old_point.payload or {}
+    new_payload = new_point.payload or {}
+
+    if old_payload.get("status") != "active":
+        raise ValueError(f"Old memory '{old_memory_id}' is not active.")
+
+    if new_payload.get("status") != "active":
+        raise ValueError(f"New memory '{new_memory_id}' is not active.")
+
+    # --------------------------------------------------------
+    # Mark old memory as superseded
+    # --------------------------------------------------------
+
+    old_updated_at = current_timestamp()
+
+    updated_old_payload = {
+        **old_payload,
+        "status": "superseded",
+        "updated_at": old_updated_at,
+    }
+
+    qdrant.set_payload(
+        collection_name=MEMORY_COLLECTION,
+        payload=updated_old_payload,
+        points=[old_memory_id],
+    )
+
+    # --------------------------------------------------------
+    # Link new memory to old memory
+    # --------------------------------------------------------
+
+    new_updated_at = current_timestamp()
+
+    updated_new_payload = {
+        **new_payload,
+        "status": "active",
+        "supersedes": old_memory_id,
+        "updated_at": new_updated_at,
+    }
+
+    qdrant.set_payload(
+        collection_name=MEMORY_COLLECTION,
+        payload=updated_new_payload,
+        points=[new_memory_id],
+    )
+
+    return {
+        "old_memory_id": old_memory_id,
+        "new_memory_id": new_memory_id,
+        "old_status": "superseded",
+        "new_status": "active",
+        "supersedes": old_memory_id,
+    }
 
 
 # ============================================================
@@ -216,7 +477,10 @@ def search_memory(
     score_threshold: float = DEFAULT_SCORE_THRESHOLD,
 ):
     """
-    Search only the memory collection.
+    Search only active memories from the memory collection.
+
+    Superseded memories remain in Qdrant for history/debugging
+    but are excluded from normal retrieval.
     """
 
     query_embedding = create_embedding(query)
@@ -226,6 +490,14 @@ def search_memory(
         query=query_embedding,
         limit=limit,
         score_threshold=score_threshold,
+        query_filter=Filter(
+            must=[
+                FieldCondition(
+                    key="status",
+                    match=MatchValue(value="active"),
+                )
+            ]
+        ),
     )
 
     return results.points
@@ -258,6 +530,84 @@ def search_knowledge(
 
 
 # ============================================================
+# Find Related Memories
+# ============================================================
+
+
+def find_related_memories(
+    text: str,
+    limit: int = MEMORY_RELATIONSHIP_LIMIT,
+    relationship_threshold: float = MEMORY_RELATIONSHIP_THRESHOLD,
+):
+    """
+    Find active memories that are semantically related to the
+    supplied memory.
+
+    This function ONLY finds candidate memories.
+
+    It does NOT determine whether the relationship is:
+        - duplicate
+        - update
+        - conflict
+        - unrelated
+    """
+
+    embedding = create_embedding(text)
+
+    results = qdrant.query_points(
+        collection_name=MEMORY_COLLECTION,
+        query=embedding,
+        limit=limit,
+        score_threshold=relationship_threshold,
+        query_filter=Filter(
+            must=[
+                FieldCondition(
+                    key="status",
+                    match=MatchValue(value="active"),
+                )
+            ]
+        ),
+    )
+
+    return results.points
+
+
+# ============================================================
+# Related Memory Endpoint
+# ============================================================
+
+
+@app.post("/find_related_memories")
+def find_related_memories_endpoint(request: SearchRequest):
+    """
+    Find active memories that are semantically related to the
+    supplied query.
+    """
+
+    results = find_related_memories(
+        text=request.query,
+        limit=request.limit,
+        relationship_threshold=request.score_threshold,
+    )
+
+    return {
+        "collection": MEMORY_COLLECTION,
+        "relationship_threshold": request.score_threshold,
+        "results": [
+            {
+                "id": str(point.id),
+                "text": point.payload.get("text"),
+                "type": point.payload.get("type"),
+                "importance": point.payload.get("importance"),
+                "status": point.payload.get("status"),
+                "score": float(point.score),
+            }
+            for point in results
+        ],
+    }
+
+
+# ============================================================
 # Duplicate Memory Detection
 # ============================================================
 
@@ -267,23 +617,21 @@ def find_duplicate_memory(
     duplicate_threshold: float = MEMORY_DUPLICATE_THRESHOLD,
 ):
     """
-    Search existing memories to determine whether the supplied
-    memory is semantically similar to an existing memory.
+    Detect whether the supplied memory is semantically similar
+    enough to an existing active memory to be considered a
+    duplicate.
 
-    This threshold is intentionally separate from the normal
-    retrieval threshold.
+    Phase 7.3 behavior.
     """
 
-    embedding = create_embedding(text)
-
-    results = qdrant.query_points(
-        collection_name=MEMORY_COLLECTION,
-        query=embedding,
+    results = find_related_memories(
+        text=text,
         limit=1,
-        score_threshold=duplicate_threshold,
+        relationship_threshold=duplicate_threshold,
     )
 
-    if not results.points:
+    if not results:
+
         return {
             "is_duplicate": False,
             "existing_memory_id": None,
@@ -291,7 +639,7 @@ def find_duplicate_memory(
             "score": None,
         }
 
-    point = results.points[0]
+    point = results[0]
 
     return {
         "is_duplicate": True,
@@ -315,8 +663,10 @@ def store_memory_if_not_duplicate(
     """
     Check for an existing similar memory before storing.
 
-    Returns information describing whether the memory was
-    created or skipped because it was a duplicate.
+    This function is retained for backward compatibility with
+    the existing manual memory endpoint.
+
+    Automatic conversation memory now uses process_memory_candidate().
     """
 
     duplicate_result = find_duplicate_memory(text)
@@ -350,6 +700,1108 @@ def store_memory_if_not_duplicate(
 
 
 # ============================================================
+# Conflict Detection
+# ============================================================
+
+
+def detect_memory_conflict(
+    new_memory: str,
+    existing_memory: str,
+) -> ConflictDetectionResult:
+    """
+    Determine whether a new memory contradicts an existing memory.
+
+    This function ONLY detects conflict.
+    """
+
+    prompt = f"""
+You are a memory conflict detection system.
+
+Your ONLY task is to determine whether the NEW MEMORY
+contradicts the EXISTING MEMORY.
+
+Return ONLY valid JSON.
+
+The JSON must contain:
+
+{{
+    "conflict": true
+}}
+
+or:
+
+{{
+    "conflict": false
+}}
+
+A "reason" field is optional.
+
+============================================================
+WHAT IS A CONFLICT?
+============================================================
+
+A conflict exists when the new memory says that a previous
+user preference, choice, tool, technology, behavior, or state
+has been replaced, reversed, or is no longer true.
+
+Treat these as conflicts:
+
+- switched from X to Y
+- moved from X to Y
+- changed from X to Y
+- no longer use X
+- stopped using X
+- instead of X, I use Y
+- I now prefer Y when the existing memory says the user
+  prefers X
+- replacement of one tool, language, framework, editor,
+  preference, or choice with another
+
+============================================================
+IMPORTANT
+============================================================
+
+Do NOT require words such as:
+
+- switched
+- replaced
+- instead
+- no longer
+
+to appear explicitly.
+
+For example:
+
+Existing:
+I prefer JavaScript for my projects.
+
+New:
+I prefer TypeScript for my projects.
+
+This IS a conflict.
+
+============================================================
+WHEN IT IS NOT A CONFLICT
+============================================================
+
+Return conflict=false when:
+
+1. The memories are duplicates or paraphrases.
+
+2. The new memory adds information.
+
+3. Both memories can remain true simultaneously.
+
+4. The memories are unrelated.
+
+Different technologies do NOT automatically conflict.
+
+For example:
+
+Existing:
+I mainly work with React.
+
+New:
+I prefer TypeScript for my projects.
+
+These can both be true.
+
+============================================================
+EXAMPLES
+============================================================
+
+Example 1:
+
+Existing:
+I prefer JavaScript for my projects.
+
+New:
+I prefer TypeScript for my projects.
+
+Output:
+{{
+    "conflict": true
+}}
+
+------------------------------------------------------------
+
+Example 2:
+
+Existing:
+I prefer JavaScript for my projects.
+
+New:
+I've switched to TypeScript for all my projects.
+
+Output:
+{{
+    "conflict": true
+}}
+
+------------------------------------------------------------
+
+Example 3:
+
+Existing:
+I prefer TypeScript for my projects.
+
+New:
+I prefer using TypeScript in my projects.
+
+Output:
+{{
+    "conflict": false
+}}
+
+------------------------------------------------------------
+
+Example 4:
+
+Existing:
+I mainly work with React.
+
+New:
+I prefer TypeScript for my projects.
+
+Output:
+{{
+    "conflict": false
+}}
+
+------------------------------------------------------------
+
+Example 5:
+
+Existing:
+I mainly work with React.
+
+New:
+I mainly work with React and TypeScript.
+
+Output:
+{{
+    "conflict": false
+}}
+
+------------------------------------------------------------
+
+Example 6:
+
+Existing:
+I use VS Code for development.
+
+New:
+I've switched to Cursor for development.
+
+Output:
+{{
+    "conflict": true
+}}
+
+============================================================
+EXISTING MEMORY
+============================================================
+
+{existing_memory}
+
+============================================================
+NEW MEMORY
+============================================================
+
+{new_memory}
+
+============================================================
+
+Return ONLY valid JSON.
+"""
+
+    try:
+
+        response = ollama.chat(
+            model=LLM_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            format="json",
+            options={
+                "temperature": 0,
+            },
+        )
+
+        raw_content = response["message"]["content"].strip()
+
+        parsed = json.loads(raw_content)
+
+        if "conflict" not in parsed:
+
+            return ConflictDetectionResult(
+                conflict=False,
+                reason=("LLM response did not contain a " "'conflict' field."),
+            )
+
+        conflict_value = parsed["conflict"]
+
+        if isinstance(conflict_value, bool):
+
+            conflict = conflict_value
+
+        elif isinstance(conflict_value, str):
+
+            normalized = conflict_value.strip().lower()
+
+            if normalized == "true":
+
+                conflict = True
+
+            elif normalized == "false":
+
+                conflict = False
+
+            else:
+
+                return ConflictDetectionResult(
+                    conflict=False,
+                    reason=("LLM returned an invalid value for " "'conflict'."),
+                )
+
+        else:
+
+            return ConflictDetectionResult(
+                conflict=False,
+                reason=("LLM returned an invalid type for " "'conflict'."),
+            )
+
+        reason = parsed.get("reason", "")
+
+        if not isinstance(reason, str):
+
+            reason = str(reason)
+
+        return ConflictDetectionResult(
+            conflict=conflict,
+            reason=reason.strip(),
+        )
+
+    except json.JSONDecodeError:
+
+        return ConflictDetectionResult(
+            conflict=False,
+            reason="LLM returned invalid JSON.",
+        )
+
+    except Exception as exc:
+
+        return ConflictDetectionResult(
+            conflict=False,
+            reason=(f"Conflict detection failed: " f"{type(exc).__name__}"),
+        )
+
+
+# ============================================================
+# Conflict Detection Endpoint
+# ============================================================
+
+
+@app.post("/detect_memory_conflict")
+def detect_memory_conflict_endpoint(
+    request: ConflictDetectionRequest,
+):
+    """
+    Test whether two memories contradict each other.
+
+    This endpoint does NOT modify Qdrant.
+    """
+
+    result = detect_memory_conflict(
+        new_memory=request.new_memory,
+        existing_memory=request.existing_memory,
+    )
+
+    return {
+        "existing_memory": request.existing_memory,
+        "new_memory": request.new_memory,
+        "conflict": result.conflict,
+        "reason": result.reason,
+    }
+
+
+# ============================================================
+# Relationship Classification
+# ============================================================
+
+
+def classify_memory_relationship(
+    new_memory: str,
+    existing_memory: str,
+) -> MemoryRelationshipResult:
+    """
+    Classify the relationship between a new memory and an
+    existing memory.
+
+    Possible relationships:
+
+        - duplicate
+        - update
+        - conflict
+        - unrelated
+
+    This function ONLY classifies the relationship.
+
+    It does NOT modify Qdrant.
+    """
+
+    prompt = f"""
+You are a memory relationship classification system.
+
+Your ONLY task is to classify the relationship between:
+
+1. EXISTING MEMORY
+2. NEW MEMORY
+
+Return ONLY valid JSON.
+
+The relationship MUST be exactly one of:
+
+- duplicate
+- update
+- conflict
+- unrelated
+
+JSON format:
+
+{{
+    "relationship": "duplicate",
+    "reason": "short explanation"
+}}
+
+============================================================
+RELATIONSHIP DEFINITIONS
+============================================================
+
+DUPLICATE
+---------
+
+The new memory expresses essentially the same information
+as the existing memory.
+
+Different wording does NOT make it an update.
+
+Example:
+
+Existing:
+I prefer TypeScript for my projects.
+
+New:
+I prefer using TypeScript in my projects.
+
+Relationship:
+duplicate
+
+------------------------------------------------------------
+
+UPDATE
+------
+
+The new memory adds, refines, or expands information from
+the existing memory without contradicting it.
+
+Example:
+
+Existing:
+I mainly work with React.
+
+New:
+I mainly work with React and TypeScript.
+
+Relationship:
+update
+
+Another example:
+
+Existing:
+I work with React.
+
+New:
+I mainly work with React for frontend projects.
+
+Relationship:
+update
+
+------------------------------------------------------------
+
+CONFLICT
+--------
+
+The new memory contradicts, replaces, reverses, or invalidates
+the existing memory.
+
+A conflict requires a genuine contradiction or replacement.
+
+DO NOT classify memories as conflict merely because they
+mention different technologies.
+
+Different technologies can be compatible.
+
+For example:
+
+Existing:
+I mainly work with React.
+
+New:
+I prefer TypeScript for my projects.
+
+These can both be true.
+
+Therefore:
+
+Relationship:
+unrelated
+
+------------------------------------------------------------
+
+UNRELATED
+---------
+
+The two memories describe separate information and do not
+represent the same fact, preference, instruction, or state.
+
+They may still be semantically related at a broad topic level.
+
+Example:
+
+Existing:
+I prefer TypeScript for my projects.
+
+New:
+I enjoy playing soccer.
+
+Relationship:
+unrelated
+
+Another important example:
+
+Existing:
+I mainly work with React.
+
+New:
+I prefer TypeScript for my projects.
+
+Relationship:
+unrelated
+
+Reason:
+React and TypeScript are different technologies and the
+statements can both be true.
+
+============================================================
+IMPORTANT CLASSIFICATION RULES
+============================================================
+
+Rule 1:
+duplicate is more specific than update.
+
+If the new memory contains essentially the same information,
+use duplicate.
+
+Rule 2:
+update means the new memory adds meaningful information to
+the existing memory.
+
+Rule 3:
+conflict means the new memory replaces, reverses, or
+contradicts the existing information.
+
+Rule 4:
+Different technologies, tools, frameworks, or concepts do
+NOT automatically conflict.
+
+Only classify them as conflict when the statements establish
+an actual replacement or incompatible choice.
+
+For example:
+
+Existing:
+I mainly work with React.
+
+New:
+I prefer TypeScript.
+
+This is NOT conflict.
+
+------------------------------------------------------------
+
+Existing:
+I use VS Code for development.
+
+New:
+I've switched to Cursor for development.
+
+This IS conflict because Cursor replaces VS Code.
+
+------------------------------------------------------------
+
+Rule 5:
+If both memories can remain true simultaneously, do NOT use
+conflict.
+
+Rule 6:
+If the memories describe clearly different information, use
+unrelated even if their general topics are similar.
+
+============================================================
+EXAMPLES
+============================================================
+
+Example 1:
+
+Existing:
+I prefer TypeScript for my projects.
+
+New:
+I prefer using TypeScript in my projects.
+
+Output:
+{{
+    "relationship": "duplicate",
+    "reason": "Both memories express the same preference."
+}}
+
+------------------------------------------------------------
+
+Example 2:
+
+Existing:
+I mainly work with React.
+
+New:
+I mainly work with React and TypeScript.
+
+Output:
+{{
+    "relationship": "update",
+    "reason": "The new memory adds TypeScript to the existing development information."
+}}
+
+------------------------------------------------------------
+
+Example 3:
+
+Existing:
+I prefer JavaScript for my projects.
+
+New:
+I prefer TypeScript for my projects.
+
+Output:
+{{
+    "relationship": "conflict",
+    "reason": "The new programming-language preference replaces JavaScript with TypeScript."
+}}
+
+------------------------------------------------------------
+
+Example 4:
+
+Existing:
+I prefer TypeScript for my projects.
+
+New:
+I enjoy playing soccer.
+
+Output:
+{{
+    "relationship": "unrelated",
+    "reason": "The memories describe unrelated information."
+}}
+
+------------------------------------------------------------
+
+Example 5:
+
+Existing:
+I use VS Code for development.
+
+New:
+I've switched to Cursor for development.
+
+Output:
+{{
+    "relationship": "conflict",
+    "reason": "The new editor choice replaces VS Code."
+}}
+
+------------------------------------------------------------
+
+Example 6:
+
+Existing:
+I mainly work with React.
+
+New:
+I prefer TypeScript for my projects.
+
+Output:
+{{
+    "relationship": "unrelated",
+    "reason": "React and TypeScript are different technologies and both statements can be true."
+}}
+
+------------------------------------------------------------
+
+Example 7:
+
+Existing:
+I work with React.
+
+New:
+I work with React for frontend projects.
+
+Output:
+{{
+    "relationship": "update",
+    "reason": "The new memory adds context to the existing React information."
+}}
+
+============================================================
+EXISTING MEMORY
+============================================================
+
+{existing_memory}
+
+============================================================
+NEW MEMORY
+============================================================
+
+{new_memory}
+
+============================================================
+
+Return ONLY valid JSON.
+"""
+
+    try:
+
+        response = ollama.chat(
+            model=LLM_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt,
+                }
+            ],
+            format="json",
+            options={
+                "temperature": 0,
+            },
+        )
+
+        raw_content = response["message"]["content"].strip()
+
+        parsed = json.loads(raw_content)
+
+        relationship = parsed.get("relationship")
+
+        allowed_relationships = {
+            "duplicate",
+            "update",
+            "conflict",
+            "unrelated",
+        }
+
+        if relationship not in allowed_relationships:
+
+            return MemoryRelationshipResult(
+                relationship="unrelated",
+                reason=("LLM returned an invalid relationship."),
+            )
+
+        reason = parsed.get("reason", "")
+
+        if not isinstance(reason, str):
+
+            reason = str(reason)
+
+        return MemoryRelationshipResult(
+            relationship=relationship,
+            reason=reason.strip(),
+        )
+
+    except json.JSONDecodeError:
+
+        return MemoryRelationshipResult(
+            relationship="unrelated",
+            reason="LLM returned invalid JSON.",
+        )
+
+    except Exception as exc:
+
+        return MemoryRelationshipResult(
+            relationship="unrelated",
+            reason=(f"Relationship classification failed: " f"{type(exc).__name__}"),
+        )
+
+
+# ============================================================
+# Relationship Classification Endpoint
+# ============================================================
+
+
+@app.post("/classify_memory_relationship")
+def classify_memory_relationship_endpoint(
+    request: MemoryRelationshipRequest,
+):
+    """
+    Classify the relationship between two memories.
+
+    This endpoint does NOT modify Qdrant.
+    """
+
+    result = classify_memory_relationship(
+        new_memory=request.new_memory,
+        existing_memory=request.existing_memory,
+    )
+
+    return {
+        "existing_memory": request.existing_memory,
+        "new_memory": request.new_memory,
+        "relationship": result.relationship,
+        "reason": result.reason,
+    }
+
+
+# ============================================================
+# Memory Manager
+# ============================================================
+
+
+def process_memory_candidate(
+    text: str,
+    memory_type: str,
+    importance: float,
+    source: str = "conversation",
+):
+    """
+    Process a new memory candidate through the complete memory
+    lifecycle.
+
+    Flow:
+
+        1. Find related active memories.
+        2. Classify each candidate.
+        3. Choose the strongest actionable relationship.
+        4. Apply the corresponding lifecycle operation.
+
+    Possible actions:
+
+        duplicate
+            Ignore the new memory.
+
+        update
+            Update the existing memory using the same memory ID.
+
+        conflict
+            Create a new memory and supersede the old memory.
+
+        unrelated
+            Create a new independent memory.
+
+    This is the central memory-management function used by /chat.
+    """
+
+    related_memories = find_related_memories(
+        text=text,
+        limit=MEMORY_RELATIONSHIP_LIMIT,
+        relationship_threshold=MEMORY_RELATIONSHIP_THRESHOLD,
+    )
+
+    # --------------------------------------------------------
+    # No related candidates
+    # --------------------------------------------------------
+
+    if not related_memories:
+
+        memory_id = store_memory(
+            text=text,
+            memory_type=memory_type,
+            importance=importance,
+            source=source,
+        )
+
+        return {
+            "action": "created",
+            "relationship": "unrelated",
+            "memory_id": memory_id,
+            "existing_memory_id": None,
+            "existing_memory_text": None,
+            "relationship_score": None,
+            "reason": "No related active memory was found.",
+        }
+
+    # --------------------------------------------------------
+    # Classify every candidate
+    # --------------------------------------------------------
+
+    classified_candidates = []
+
+    for point in related_memories:
+
+        existing_text = point.payload.get("text", "")
+
+        relationship_result = classify_memory_relationship(
+            new_memory=text,
+            existing_memory=existing_text,
+        )
+
+        classified_candidates.append(
+            {
+                "point": point,
+                "relationship": relationship_result.relationship,
+                "reason": relationship_result.reason,
+                "score": float(point.score),
+            }
+        )
+
+    # --------------------------------------------------------
+    # Relationship priority
+    # --------------------------------------------------------
+    #
+    # When multiple related memories are returned:
+    #
+    # duplicate > conflict > update > unrelated
+    #
+    # Within the same relationship type, use the highest
+    # semantic similarity score.
+    # --------------------------------------------------------
+
+    relationship_priority = {
+        "duplicate": 4,
+        "conflict": 3,
+        "update": 2,
+        "unrelated": 1,
+    }
+
+    classified_candidates.sort(
+        key=lambda candidate: (
+            relationship_priority.get(
+                candidate["relationship"],
+                0,
+            ),
+            candidate["score"],
+        ),
+        reverse=True,
+    )
+
+    selected = classified_candidates[0]
+
+    selected_point = selected["point"]
+    selected_relationship = selected["relationship"]
+    selected_reason = selected["reason"]
+    selected_score = selected["score"]
+
+    existing_memory_id = str(selected_point.id)
+    existing_memory_text = selected_point.payload.get("text")
+
+    # ========================================================
+    # Duplicate
+    # ========================================================
+
+    if selected_relationship == "duplicate":
+
+        return {
+            "action": "ignored",
+            "relationship": "duplicate",
+            "memory_id": None,
+            "existing_memory_id": existing_memory_id,
+            "existing_memory_text": existing_memory_text,
+            "relationship_score": selected_score,
+            "reason": selected_reason,
+        }
+
+    # ========================================================
+    # Update
+    # ========================================================
+
+    if selected_relationship == "update":
+
+        existing_payload = selected_point.payload or {}
+
+        updated = update_memory(
+            memory_id=existing_memory_id,
+            text=text,
+            memory_type=memory_type,
+            importance=importance,
+        )
+
+        return {
+            "action": "updated",
+            "relationship": "update",
+            "memory_id": updated["memory_id"],
+            "existing_memory_id": existing_memory_id,
+            "existing_memory_text": existing_memory_text,
+            "relationship_score": selected_score,
+            "reason": selected_reason,
+            "created_at": updated["created_at"],
+            "updated_at": updated["updated_at"],
+        }
+
+    # ========================================================
+    # Conflict
+    # ========================================================
+
+    if selected_relationship == "conflict":
+
+        new_memory_id = store_memory(
+            text=text,
+            memory_type=memory_type,
+            importance=importance,
+            source=source,
+            supersedes=existing_memory_id,
+        )
+
+        supersede_result = supersede_memory(
+            old_memory_id=existing_memory_id,
+            new_memory_id=new_memory_id,
+        )
+
+        return {
+            "action": "superseded",
+            "relationship": "conflict",
+            "memory_id": new_memory_id,
+            "existing_memory_id": existing_memory_id,
+            "existing_memory_text": existing_memory_text,
+            "relationship_score": selected_score,
+            "reason": selected_reason,
+            "old_status": supersede_result["old_status"],
+            "new_status": supersede_result["new_status"],
+            "supersedes": existing_memory_id,
+        }
+
+    # ========================================================
+    # Unrelated
+    # ========================================================
+
+    memory_id = store_memory(
+        text=text,
+        memory_type=memory_type,
+        importance=importance,
+        source=source,
+    )
+
+    return {
+        "action": "created",
+        "relationship": "unrelated",
+        "memory_id": memory_id,
+        "existing_memory_id": None,
+        "existing_memory_text": None,
+        "relationship_score": None,
+        "reason": (
+            "Related candidates were found, but none represented "
+            "an actionable relationship."
+        ),
+    }
+
+
+# ============================================================
+# Memory Manager Endpoint
+# ============================================================
+
+
+@app.post("/process_memory_candidate")
+def process_memory_candidate_endpoint(
+    request: ProcessMemoryRequest,
+):
+    """
+    Test the complete memory-management lifecycle.
+
+    This endpoint can be used to test Phase 7.8 without
+    calling /chat.
+    """
+
+    result = process_memory_candidate(
+        text=request.text,
+        memory_type=request.memory_type,
+        importance=request.importance,
+        source=request.source,
+    )
+
+    return result
+
+
+# ============================================================
+# Memory Update Endpoint
+# ============================================================
+
+
+@app.put("/update_memory")
+def update_memory_endpoint(
+    request: MemoryUpdateRequest,
+):
+    """
+    Update an existing active memory.
+
+    This endpoint is for testing Phase 7.6.
+    """
+
+    try:
+
+        result = update_memory(
+            memory_id=request.memory_id,
+            text=request.text,
+            memory_type=request.memory_type,
+            importance=request.importance,
+        )
+
+        return {
+            "status": "updated",
+            **result,
+        }
+
+    except ValueError as exc:
+
+        return {
+            "status": "error",
+            "error": str(exc),
+        }
+
+
+# ============================================================
+# Supersede Memory Endpoint
+# ============================================================
+
+
+@app.put("/supersede_memory")
+def supersede_memory_endpoint(
+    request: SupersedeMemoryRequest,
+):
+    """
+    Mark an old active memory as superseded and link the new
+    active memory to it.
+    """
+
+    try:
+
+        result = supersede_memory(
+            old_memory_id=request.old_memory_id,
+            new_memory_id=request.new_memory_id,
+        )
+
+        return {
+            "status": "superseded",
+            **result,
+        }
+
+    except ValueError as exc:
+
+        return {
+            "status": "error",
+            "error": str(exc),
+        }
+
+
+# ============================================================
 # Manual Memory Endpoint
 # ============================================================
 
@@ -377,7 +1829,9 @@ def add_memory(request: MemoryRequest):
 
 
 @app.post("/add_memory_file_upload")
-async def add_memory_file_upload(file: UploadFile = File(...)):
+async def add_memory_file_upload(
+    file: UploadFile = File(...),
+):
 
     content = await file.read()
 
@@ -407,6 +1861,7 @@ async def add_memory_file_upload(file: UploadFile = File(...)):
     else:
 
         try:
+
             text = content.decode("utf-8")
 
         except UnicodeDecodeError:
@@ -471,6 +1926,7 @@ def search_memory_endpoint(request: SearchRequest):
                 "text": point.payload.get("text"),
                 "type": point.payload.get("type"),
                 "importance": point.payload.get("importance"),
+                "status": point.payload.get("status"),
                 "score": float(point.score),
             }
             for point in results
@@ -826,7 +2282,7 @@ def chat(request: ChatRequest):
 
             part += f" | Chunk: " f"{point.payload['chunk_index']}"
 
-        part += f"\n{point.payload.get('text', '')}"
+        part += f"\n" f"{point.payload.get('text', '')}"
 
         knowledge_context_parts.append(part)
 
@@ -904,21 +2360,22 @@ Instructions:
     memory_candidate = analyze_memory(request.query)
 
     # --------------------------------------------------------
-    # 9. Duplicate Check + Store
+    # 9. Automatic Memory Management
     # --------------------------------------------------------
 
-    memory_result = {
-        "memory_stored": False,
-        "memory_duplicate": False,
+    memory_management = {
+        "action": "none",
+        "relationship": None,
         "memory_id": None,
         "existing_memory_id": None,
         "existing_memory_text": None,
-        "duplicate_score": None,
+        "relationship_score": None,
+        "reason": None,
     }
 
     if memory_candidate.remember:
 
-        memory_result = store_memory_if_not_duplicate(
+        memory_management = process_memory_candidate(
             text=memory_candidate.text,
             memory_type=memory_candidate.type,
             importance=memory_candidate.importance,
@@ -941,10 +2398,5 @@ Instructions:
             "text": memory_candidate.text,
             "importance": memory_candidate.importance,
         },
-        "memory_stored": memory_result["memory_stored"],
-        "memory_duplicate": memory_result["memory_duplicate"],
-        "memory_id": memory_result["memory_id"],
-        "existing_memory_id": memory_result["existing_memory_id"],
-        "existing_memory_text": memory_result["existing_memory_text"],
-        "duplicate_score": memory_result["duplicate_score"],
+        "memory_management": memory_management,
     }
